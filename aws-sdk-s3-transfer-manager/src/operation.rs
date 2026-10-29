@@ -5,9 +5,10 @@
 
 use std::{fs::Metadata, path::Path, sync::Arc};
 
+use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_sdk_s3::client::customize::CustomizableOperation;
 
-use crate::config::user_agent::operation_features;
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::transfer::{StateMachineTerminalReceiver, TransferContext};
 
@@ -38,14 +39,18 @@ pub(crate) const DEFAULT_DELIMITER: &str = "/";
 pub(crate) const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 512;
 
 /// One transfer manager operation: its lifecycle, and what its S3 requests share.
-#[derive(Clone, Debug)]
 pub(crate) struct OperationContext {
     transfer: TransferContext,
     kind: OperationKind,
-    requests: Arc<RequestOverrides>,
+    /// Operation features only.
+    listing: aws_sdk_s3::config::Builder,
+    /// `listing` plus the bucket's retry partition.
+    control: aws_sdk_s3::config::Builder,
+    /// `control` plus the tightened stalled-stream grace.
+    body: aws_sdk_s3::config::Builder,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum OperationKind {
     Upload { from_file: bool },
     Download { to_file: bool },
@@ -89,8 +94,9 @@ impl OperationContext {
         parent: Option<OperationKind>,
         bucket: Option<&str>,
     ) -> Self {
-        let mut control =
+        let listing =
             aws_sdk_s3::config::Builder::default().interceptor(operation_features(kind, parent));
+        let mut control = listing.clone();
         if let Some(bucket) = bucket {
             control = control.retry_partition(transfer.handle.retry_partition(bucket));
         }
@@ -100,7 +106,9 @@ impl OperationContext {
         Self {
             transfer,
             kind,
-            requests: Arc::new(RequestOverrides { control, body }),
+            listing,
+            control,
+            body,
         }
     }
 
@@ -109,17 +117,25 @@ impl OperationContext {
     }
 
     /// The override for one request of this operation.
+    ///
+    /// A listing stays on the client's default retry partition, and only a request that
+    /// streams an object body tightens stalled-stream protection. A discovery GET keeps the
+    /// client's grace; a re-issue of its range gets it.
     pub(crate) fn config_override(&self, request: S3Request) -> aws_sdk_s3::config::Builder {
-        if request.tightens_stall_protection() {
-            self.requests.body.clone()
-        } else {
-            self.requests.control.clone()
+        match request {
+            S3Request::ListObjectsV2 => self.listing.clone(),
+            S3Request::HeadObject
+            | S3Request::GetObjectDiscovery
+            | S3Request::CreateMultipartUpload
+            | S3Request::CompleteMultipartUpload
+            | S3Request::AbortMultipartUpload => self.control.clone(),
+            S3Request::GetObjectRange | S3Request::PutObject | S3Request::UploadPart => {
+                self.body.clone()
+            }
         }
     }
 
-    /// Applies [`config_override`](Self::config_override). The only `config_override`
-    /// call for a transfer manager request; add further per-request customization
-    /// with `.interceptor(..)`, which composes with it.
+    /// Applies [`config_override`](Self::config_override).
     pub(crate) fn customize<T, E, B>(
         &self,
         request: S3Request,
@@ -127,6 +143,31 @@ impl OperationContext {
     ) -> CustomizableOperation<T, E, B> {
         op.config_override(self.config_override(request))
     }
+}
+
+impl std::fmt::Debug for OperationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationContext")
+            .field("transfer", &self.transfer)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The features an operation of `kind` adds to the requests it issues, on top of the
+/// client's. A child takes its directory feature from the operation that spawned it.
+fn operation_features(kind: OperationKind, parent: Option<OperationKind>) -> OperationFeatures {
+    let directory = match parent.unwrap_or(kind) {
+        OperationKind::UploadObjects => Some(AwsSdkFeature::S3TransferUploadDirectory),
+        OperationKind::DownloadObjects => Some(AwsSdkFeature::S3TransferDownloadDirectory),
+        _ => None,
+    };
+    let file = matches!(
+        kind,
+        OperationKind::Upload { from_file: true } | OperationKind::Download { to_file: true }
+    )
+    .then_some(AwsSdkFeature::S3FilePath);
+    OperationFeatures::new(directory.into_iter().chain(file).collect())
 }
 
 /// Every S3 request the transfer manager sends. The name decides its override.
@@ -141,26 +182,6 @@ pub(crate) enum S3Request {
     UploadPart,
     CompleteMultipartUpload,
     AbortMultipartUpload,
-}
-
-impl S3Request {
-    /// Whether the request streams an object body under the tightened stalled-stream
-    /// grace. A discovery GET keeps the client's; a re-issue of its range gets it.
-    fn tightens_stall_protection(self) -> bool {
-        matches!(
-            self,
-            Self::GetObjectRange | Self::PutObject | Self::UploadPart
-        )
-    }
-}
-
-/// An operation's request overrides, built once when the operation is created.
-#[derive(Debug)]
-struct RequestOverrides {
-    /// Retry partition and operation features.
-    control: aws_sdk_s3::config::Builder,
-    /// `control` plus the tightened stalled-stream grace.
-    body: aws_sdk_s3::config::Builder,
 }
 
 // Checks if the target path at `path`, with the provided `metadata`, represents a directory.
@@ -184,34 +205,40 @@ pub(crate) fn validate_target_is_dir(metadata: &Metadata, path: &Path) -> Result
 mod tests {
     use super::*;
 
-    /// The request's name alone picks its override: every request shares the operation's retry
-    /// partition, and only body transfers tighten stalled-stream protection.
+    /// The request's name alone picks its override: a listing stays on the default retry
+    /// partition, every other request shares the bucket's, and only body transfers tighten
+    /// stalled-stream protection.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn request_name_picks_its_override() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = crate::client::Handle::new_for_test(config, 1);
+        let partition = handle.retry_partition("bucket");
         let kind = OperationKind::Upload { from_file: false };
         let (op, _rx) = OperationContext::new(handle, kind, Some("bucket"));
-        for (request, tightened) in [
-            (S3Request::HeadObject, false),
-            (S3Request::GetObjectDiscovery, false),
-            (S3Request::GetObjectRange, true),
-            (S3Request::ListObjectsV2, false),
-            (S3Request::PutObject, true),
-            (S3Request::CreateMultipartUpload, false),
-            (S3Request::UploadPart, true),
-            (S3Request::CompleteMultipartUpload, false),
-            (S3Request::AbortMultipartUpload, false),
+        for (request, partitioned, tightened) in [
+            (S3Request::HeadObject, true, false),
+            (S3Request::GetObjectDiscovery, true, false),
+            (S3Request::GetObjectRange, true, true),
+            (S3Request::ListObjectsV2, false, false),
+            (S3Request::PutObject, true, true),
+            (S3Request::CreateMultipartUpload, true, false),
+            (S3Request::UploadPart, true, true),
+            (S3Request::CompleteMultipartUpload, true, false),
+            (S3Request::AbortMultipartUpload, true, false),
         ] {
             let config = op.config_override(request).build();
+            assert_eq!(
+                config.retry_partition(),
+                partitioned.then_some(&partition),
+                "{request:?}"
+            );
             assert_eq!(
                 config.stalled_stream_protection().is_some(),
                 tightened,
                 "{request:?}"
             );
-            assert!(config.retry_partition().is_some(), "{request:?}");
         }
     }
 }

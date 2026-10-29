@@ -539,10 +539,10 @@ mod tests {
         let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) =
             OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
-        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
-        ctx.transfer().set_cancelled();
-        ctx.transfer().signal_terminal();
+        transfer.ctx().set_cancelled();
+        transfer.ctx().signal_terminal();
 
         let inner = DownloadHandleInner {
             transfer,

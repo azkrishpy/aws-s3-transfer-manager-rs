@@ -52,7 +52,6 @@ impl DownloadFluentBuilder {
             self.handle,
             input,
             path.into(),
-            None,
             &crate::operation::download::sink::FileSinkFactory,
         )
         .await

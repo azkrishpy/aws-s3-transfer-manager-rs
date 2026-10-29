@@ -115,7 +115,7 @@ impl DownloadTransfer {
         writer: BodyWriter,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
-        // to a window in parts before `ctx` and `input` are moved into the struct.
+        // to a window in parts before `op` and `input` are moved into the struct.
         let window = super::read_ahead::resolve_window(
             input.read_ahead(),
             op.transfer().handle.config.read_ahead(),
@@ -3735,7 +3735,6 @@ mod tests {
             Arc::clone(&handle),
             input,
             dest.clone(),
-            None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
         .await

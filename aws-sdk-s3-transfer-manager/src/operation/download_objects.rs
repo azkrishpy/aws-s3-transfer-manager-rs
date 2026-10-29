@@ -65,10 +65,11 @@ impl DownloadObjects {
             builder.build()
         });
 
-        // The listing stays on the default retry partition: it has no retry loop of
-        // its own, so throttling caused by the children would exhaust its retries.
-        let (op, completion_rx) =
-            OperationContext::new(handle.clone(), OperationKind::DownloadObjects, None);
+        let (op, completion_rx) = OperationContext::new(
+            handle.clone(),
+            OperationKind::DownloadObjects,
+            Some(&bucket),
+        );
         let walk_ctx = S3WalkContext::builder()
             .sdk_client(handle.s3_client.clone())
             .request_override(op.config_override(S3Request::ListObjectsV2))

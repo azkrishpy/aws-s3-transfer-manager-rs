@@ -217,7 +217,7 @@ of a service that is shedding load. Capacity stays at the SDK default (500); a l
 absorb a larger initial burst (more amplification) without addressing recovery.
 
 The partition carries a freshly-allocated token bucket, so it is built once and cached on the Handle
-(`bucket_partition_override`) — all operations and retries to a bucket share one live instance.
+(`Handle::retry_partition`) — all operations and retries to a bucket share one live instance.
 Building it per-operation would give each request its own bucket and defeat the shared budget.
 
 ### Transient-transport classification

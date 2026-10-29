@@ -10,7 +10,6 @@ use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, Fra
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
-use crate::operation::OperationKind;
 use crate::runtime::platform::MachineProfile;
 use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
 use crate::Config;
@@ -60,29 +59,16 @@ pub(crate) fn install(
     );
 }
 
-/// The features an operation of `kind` adds to the requests it issues, on top of the
-/// client's. A child takes its directory feature from the operation that spawned it.
-pub(crate) fn operation_features(
-    kind: OperationKind,
-    parent: Option<OperationKind>,
-) -> OperationFeatures {
-    let directory = match parent.unwrap_or(kind) {
-        OperationKind::UploadObjects => Some(AwsSdkFeature::S3TransferUploadDirectory),
-        OperationKind::DownloadObjects => Some(AwsSdkFeature::S3TransferDownloadDirectory),
-        _ => None,
-    };
-    let file = matches!(
-        kind,
-        OperationKind::Upload { from_file: true } | OperationKind::Download { to_file: true }
-    )
-    .then_some(AwsSdkFeature::S3FilePath);
-    OperationFeatures(directory.into_iter().chain(file).collect())
-}
-
 /// Adds an operation's features to each request it is attached to, so they never mark the
 /// shared client.
 #[derive(Debug)]
 pub(crate) struct OperationFeatures(Vec<AwsSdkFeature>);
+
+impl OperationFeatures {
+    pub(crate) fn new(features: Vec<AwsSdkFeature>) -> Self {
+        Self(features)
+    }
+}
 
 impl Intercept for OperationFeatures {
     fn name(&self) -> &'static str {

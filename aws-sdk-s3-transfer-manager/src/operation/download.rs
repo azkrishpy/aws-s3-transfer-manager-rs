@@ -131,15 +131,11 @@ impl Download {
     /// the temp file or the sink is returned as
     /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
     /// could not be created is removed.
-    ///
-    /// When `parent` is `Some`, the transfer is linked as its child via
-    /// [`OperationContext::child`].
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
-        parent: Option<&OperationContext>,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
@@ -157,7 +153,7 @@ impl Download {
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
-        let inner = Self::orchestrate_with_sink(handle, input, sink, parent)?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, None)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 

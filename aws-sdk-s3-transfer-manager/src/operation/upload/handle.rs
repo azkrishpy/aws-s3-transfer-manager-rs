@@ -267,12 +267,11 @@ mod tests {
         let stream = input.take_body();
         let (ctx, completion_rx) =
             OperationContext::new(handle, OperationKind::Upload { from_file: false }, None);
-        let transfer =
-            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();
+        let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 
         // Drive to Cancelled terminal state.
-        ctx.transfer().set_cancelled();
-        ctx.transfer().signal_terminal();
+        transfer.ctx().set_cancelled();
+        transfer.ctx().signal_terminal();
 
         let upload_handle = UploadHandle::new(completion_rx, transfer);
         let err = upload_handle

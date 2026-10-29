@@ -22,7 +22,7 @@
 //!   ([`bucket_retry_partition`](crate::retry::bucket_retry_partition)) is given
 //!   a time-based refill so a drained budget recovers.
 //! - **Mid-upload-body stall** (the peer stops making progress on the request
-//!   body): stalled-stream protection ([`Handle::upload_override`](crate::client::Handle::upload_override)).
+//!   body): stalled-stream protection ([`S3Request::UploadPart`]).
 //! - **Response never arrives after the body is fully sent**: NOT bounded. This
 //!   is the response-first-byte gap — stalled-stream protection watches
 //!   request-body throughput, which has already completed, and the SDK sets no
@@ -696,7 +696,7 @@ impl UploadTransfer {
         //
         // No adaptive latency deadline on the upload path: timing the whole
         // part-send (body-push + response) is size-blind and false-cancels large
-        // parts on slow links. Stalled-stream protection (`upload_override`)
+        // parts on slow links. Stalled-stream protection (`S3Request::UploadPart`)
         // bounds a mid-upload-body stall; a response that never arrives after the
         // body is fully sent is not bounded here (see the module docs on the
         // response-first-byte gap).
@@ -860,7 +860,7 @@ impl UploadTransfer {
 
         // Retry transient transport and throttles (same rationale as UploadPart).
         // No adaptive latency deadline; a mid-upload-body stall is bounded by
-        // stalled-stream protection (`upload_override`), a post-send response-wait
+        // stalled-stream protection (`S3Request::PutObject`), a post-send response-wait
         // is not (see the module docs on the response-first-byte gap).
         let mut req_metrics = self
             .inner
