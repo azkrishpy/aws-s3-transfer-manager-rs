@@ -62,13 +62,7 @@ pub(crate) fn install(
 /// Adds an operation's features to each request it is attached to, so they never mark the
 /// shared client.
 #[derive(Debug)]
-pub(crate) struct OperationFeatures(Vec<AwsSdkFeature>);
-
-impl OperationFeatures {
-    pub(crate) fn new(features: Vec<AwsSdkFeature>) -> Self {
-        Self(features)
-    }
-}
+pub(crate) struct OperationFeatures(pub(crate) Vec<AwsSdkFeature>);
 
 impl Intercept for OperationFeatures {
     fn name(&self) -> &'static str {

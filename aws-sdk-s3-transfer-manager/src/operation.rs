@@ -167,7 +167,7 @@ fn operation_features(kind: OperationKind, parent: Option<OperationKind>) -> Ope
         OperationKind::Upload { from_file: true } | OperationKind::Download { to_file: true }
     )
     .then_some(AwsSdkFeature::S3FilePath);
-    OperationFeatures::new(directory.into_iter().chain(file).collect())
+    OperationFeatures(directory.into_iter().chain(file).collect())
 }
 
 /// Every S3 request the transfer manager sends. The name decides its override.
@@ -235,8 +235,8 @@ mod tests {
                 "{request:?}"
             );
             assert_eq!(
-                config.stalled_stream_protection().is_some(),
-                tightened,
+                config.stalled_stream_protection().map(|s| s.grace_period()),
+                tightened.then(|| crate::retry::tightened_ssp().grace_period()),
                 "{request:?}"
             );
         }

@@ -98,7 +98,7 @@ impl Handle {
         matches!(self.config.part_size(), PartSize::Target(_))
     }
 
-    /// The retry partition shared by every request to `bucket`.
+    /// The retry partition shared by an operation's non-listing requests to `bucket`.
     ///
     /// The partition is cached so all operations to the same bucket share one
     /// live token bucket (and its refill): under a total outage the sustained
