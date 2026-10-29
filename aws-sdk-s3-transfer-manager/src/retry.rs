@@ -406,7 +406,7 @@ const RETRY_BUCKET_CAPACITY: usize = 500;
 ///
 /// Callers MUST NOT call this per-operation: the returned partition carries a
 /// freshly-allocated token bucket. Cache the partition on the Handle (via
-/// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override))
+/// [`Handle::retry_partition`](crate::client::Handle::retry_partition))
 /// so all operations to a bucket share one live bucket instance.
 pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
     RetryPartition::custom(format!("s3-tm-{bucket}"))

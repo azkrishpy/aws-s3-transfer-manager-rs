@@ -12,9 +12,10 @@ use crate::operation::download::body::{new_recv_body_with_disk_mode, RecvBodyCon
 use crate::operation::download::sink::SinkFactory;
 use crate::operation::download::transfer::DownloadWork;
 use crate::operation::download::{DownloadInput, DownloadTransfer};
+use crate::operation::{OperationContext, OperationKind};
 use crate::runtime::buffer_pool::Reservation;
 use crate::scheduler::test_util::assert_ready;
-use crate::transfer::{IoRequest, TransferContext, WorkOutcome};
+use crate::transfer::{IoRequest, WorkOutcome};
 use crate::types::BucketType;
 
 /// Deterministic object contents of `len` bytes, distinct from the zeros an
@@ -150,7 +151,8 @@ pub(crate) fn disk_transfer(
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::File::create(dir.path().join("out")).unwrap();
     let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false).unwrap());
-    let (ctx, _completion_rx) = TransferContext::new(handle);
+    let (ctx, _completion_rx) =
+        OperationContext::new(handle, OperationKind::Download { to_file: true }, None);
     let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
     (transfer, consumer, dir)
 }

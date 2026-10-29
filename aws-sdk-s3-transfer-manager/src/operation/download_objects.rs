@@ -21,10 +21,8 @@ use transfer::DownloadObjectsTransfer;
 
 use std::sync::Arc;
 
-use crate::config::user_agent::OperationFeatures;
 use crate::io::walk::{S3WalkContext, S3Walker};
-use crate::transfer::TransferContext;
-use aws_runtime::sdk_feature::AwsSdkFeature;
+use crate::operation::{OperationContext, OperationKind, S3Request};
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -67,17 +65,18 @@ impl DownloadObjects {
             builder.build()
         });
 
-        let features = OperationFeatures::new([AwsSdkFeature::S3TransferDownloadDirectory]);
-        let s3_client = features.apply_to_client(&handle.s3_client);
+        // The listing stays on the default retry partition: it has no retry loop of
+        // its own, so throttling caused by the children would exhaust its retries.
+        let (op, completion_rx) =
+            OperationContext::new(handle.clone(), OperationKind::DownloadObjects, None);
         let walk_ctx = S3WalkContext::builder()
-            .sdk_client(s3_client)
+            .sdk_client(handle.s3_client.clone())
+            .request_override(op.config_override(S3Request::ListObjectsV2))
             .bucket(&bucket)
             .build();
         let walk = walker.walk(walk_ctx);
 
-        let (ctx, completion_rx) = TransferContext::new(handle.clone());
-
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, pipeline_depth);
+        let transfer = DownloadObjectsTransfer::new(op, &input, walk, pipeline_depth);
 
         handle
             .scheduler

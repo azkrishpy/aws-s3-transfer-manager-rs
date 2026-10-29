@@ -59,6 +59,7 @@ use crate::operation::upload::request::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
+use crate::operation::{OperationContext, S3Request};
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
 
@@ -100,7 +101,7 @@ pub(crate) struct UploadTransfer {
 #[derive(Debug)]
 struct UploadTransferInner {
     /// Common transfer lifecycle management
-    ctx: TransferContext,
+    op: OperationContext,
     /// State machine for work progression
     state: Mutex<UploadState>,
     /// Optional upload-wide event and summary observation.
@@ -117,7 +118,7 @@ struct UploadTransferInner {
 
 impl UploadTransfer {
     pub(crate) fn try_new(
-        ctx: TransferContext,
+        op: OperationContext,
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
@@ -128,17 +129,19 @@ impl UploadTransfer {
         // and at completion hold the body to exactly that many bytes.
         let size_hint = apply_content_length(size_hint, request.content_length())
             .map_err(crate::error::invalid_input)?;
-        let observability =
-            UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
+        let observability = UploadObservability::new(
+            op.transfer().handle.config.diagnostics().transfer(),
+            size_hint,
+        );
 
         // Only equal bounds are a known total. A bounded stream reports no total while in progress;
         // its actual size is published after EOF.
         if size_hint.upper() == Some(size_hint.lower()) {
-            ctx.set_total_bytes(size_hint.lower());
+            op.transfer().set_total_bytes(size_hint.lower());
         }
 
         let inner = Arc::new(UploadTransferInner {
-            ctx,
+            op,
             state: Mutex::new(UploadState::PendingInit {
                 stream: Some(stream),
                 size_hint,
@@ -155,20 +158,24 @@ impl UploadTransfer {
 
     /// Access the transfer context.
     pub(crate) fn ctx(&self) -> &TransferContext {
-        &self.inner.ctx
+        self.inner.op.transfer()
+    }
+
+    pub(crate) fn op(&self) -> &OperationContext {
+        &self.inner.op
     }
 
     fn observe_event(&self, event: UploadEvent, state: &UploadState) {
         let snapshot = snapshot_state(state);
         self.inner
             .observability
-            .observe_event(self.inner.ctx.id, event, snapshot);
+            .observe_event(self.ctx().id, event, snapshot);
     }
 
     /// Emits the upload terminal summary before notifying the owning handle.
     fn report_terminal(&self) {
-        self.inner.ctx.finalize_terminal_metrics();
-        if !self.inner.ctx.claim_terminal_report() {
+        self.ctx().finalize_terminal_metrics();
+        if !self.ctx().claim_terminal_report() {
             return;
         }
         let state_snapshot = {
@@ -181,16 +188,16 @@ impl UploadTransfer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot_state(&state)
         };
-        let pending = self.inner.ctx.pending_stats().unwrap_or_default();
+        let pending = self.ctx().pending_stats().unwrap_or_default();
         let _ = self
             .inner
             .observability
             .report_terminal(UploadTerminalReport {
-                transfer_id: self.inner.ctx.id,
-                status: self.inner.ctx.transfer_status(),
-                error_kind: self.inner.ctx.error_kind(),
-                metrics: self.inner.ctx.metrics(),
-                request_total: self.inner.ctx.metrics.request_metrics(),
+                transfer_id: self.ctx().id,
+                status: self.ctx().transfer_status(),
+                error_kind: self.ctx().error_kind(),
+                metrics: self.ctx().metrics(),
+                request_total: self.ctx().metrics.request_metrics(),
                 pending,
                 state_snapshot,
             });
@@ -227,7 +234,7 @@ impl UploadTransfer {
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
-        if !self.inner.ctx.is_active() {
+        if !self.ctx().is_active() {
             return PollWork::Done;
         }
 
@@ -241,8 +248,7 @@ impl UploadTransfer {
                     stream,
                 } => {
                     if *init_in_flight {
-                        self.inner
-                            .ctx
+                        self.ctx()
                             .set_pending(PendingCause::in_flight_work("create_multipart_upload"));
                         return PollWork::Pending;
                     }
@@ -251,14 +257,14 @@ impl UploadTransfer {
                         None => true,
                         Some(upper) => {
                             stream.as_ref().is_some_and(|stream| stream.is_mpu_only())
-                                || upper >= self.inner.ctx.handle.mpu_threshold_bytes()
+                                || upper >= self.ctx().handle.mpu_threshold_bytes()
                         }
                     };
                     return if use_mpu {
                         *init_in_flight = true;
                         self.inner.observability.select_mode(UploadMode::Multipart);
                         self.inner.observability.observe_event(
-                            self.inner.ctx.id,
+                            self.ctx().id,
                             UploadEvent::MultipartUploadScheduled,
                             UploadStateSnapshot::inactive(
                                 UploadExecutionState::CreateMultipartUploadInFlight,
@@ -285,7 +291,7 @@ impl UploadTransfer {
                             UploadEvent::NewPartScheduled
                         };
                         self.inner.observability.observe_event(
-                            self.inner.ctx.id,
+                            self.ctx().id,
                             event,
                             parts.snapshot(),
                         );
@@ -295,7 +301,7 @@ impl UploadTransfer {
                     }
                     if let Some(work) = parts.maybe_start_empty_object_part() {
                         self.inner.observability.observe_event(
-                            self.inner.ctx.id,
+                            self.ctx().id,
                             UploadEvent::EmptyObjectPartScheduled,
                             parts.snapshot(),
                         );
@@ -307,7 +313,7 @@ impl UploadTransfer {
                     let pending_reason = parts.pending_reason();
                     if parts.is_complete() {
                         self.inner.observability.observe_event(
-                            self.inner.ctx.id,
+                            self.ctx().id,
                             UploadEvent::CompletionReady,
                             snapshot,
                         );
@@ -316,7 +322,7 @@ impl UploadTransfer {
                         continue;
                     }
                     self.inner.observability.observe_state(snapshot);
-                    self.inner.ctx.set_pending(pending_reason);
+                    self.ctx().set_pending(pending_reason);
                     return PollWork::Pending;
                 }
                 UploadState::Completing { .. } => {
@@ -341,14 +347,12 @@ impl UploadTransfer {
                     });
                 }
                 UploadState::CompleteInFlight { .. } => {
-                    self.inner
-                        .ctx
+                    self.ctx()
                         .set_pending(PendingCause::in_flight_work("complete_multipart_upload"));
                     return PollWork::Pending;
                 }
                 UploadState::PutObjectInFlight => {
-                    self.inner
-                        .ctx
+                    self.ctx()
                         .set_pending(PendingCause::in_flight_work("put_object"));
                     return PollWork::Pending;
                 }
@@ -370,12 +374,12 @@ impl UploadTransfer {
     async fn execute_create_mpu(&self) -> WorkOutcome {
         let outcome = self.do_execute_create_mpu().await;
         // state changed - try to wake if we were pending
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
         outcome
     }
 
     async fn do_execute_create_mpu(&self) -> WorkOutcome {
-        let client = self.inner.ctx.s3_client();
+        let client = self.ctx().s3_client();
 
         let mpu_req =
             copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
@@ -383,15 +387,10 @@ impl UploadTransfer {
         let req_metrics = self
             .inner
             .observability
-            .start_request(&self.inner.ctx, UploadRequestKind::CreateMultipartUpload);
-        let response = mpu_req
-            .customize()
-            .config_override(
-                self.inner
-                    .ctx
-                    .handle
-                    .bucket_partition_override(self.inner.request.bucket()),
-            )
+            .start_request(self.ctx(), UploadRequestKind::CreateMultipartUpload);
+        let response = self
+            .op()
+            .customize(S3Request::CreateMultipartUpload, mpu_req.customize())
             .send()
             .instrument(tracing::debug_span!("send-create-multipart-upload"))
             .await;
@@ -419,10 +418,10 @@ impl UploadTransfer {
         // without one uses the configured size and enforces the limit as parts are produced.
         let part_size = match size_hint.upper() {
             Some(upper) => cmp::max(
-                self.inner.ctx.handle.upload_part_size_bytes(),
+                self.ctx().handle.upload_part_size_bytes(),
                 upper.div_ceil(MAX_PARTS),
             ),
-            None => self.inner.ctx.handle.upload_part_size_bytes(),
+            None => self.ctx().handle.upload_part_size_bytes(),
         };
         let plan = if reads_until_eof {
             PartPlan::UntilEof { size_hint }
@@ -443,10 +442,10 @@ impl UploadTransfer {
             match PartReaderBuilder::new()
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
-                .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
-                .buffer_pool(self.inner.ctx.handle.buffer_pool.clone())
-                .metrics(std::sync::Arc::clone(&self.inner.ctx.metrics))
-                .telemetry(std::sync::Arc::clone(&self.inner.ctx.handle.telemetry))
+                .direct_io(self.ctx().handle.runtime.components().direct_io())
+                .buffer_pool(self.ctx().handle.buffer_pool.clone())
+                .metrics(std::sync::Arc::clone(&self.ctx().metrics))
+                .telemetry(std::sync::Arc::clone(&self.ctx().handle.telemetry))
                 .build()
             {
                 Ok(reader) => reader,
@@ -478,7 +477,7 @@ impl UploadTransfer {
         };
         self.inner.observability.multipart_created();
         self.inner.observability.observe_event(
-            self.inner.ctx.id,
+            self.ctx().id,
             UploadEvent::MultipartUploadCreated,
             snapshot,
         );
@@ -497,7 +496,7 @@ impl UploadTransfer {
         if work.is_empty_object() {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 "empty source satisfied its size hint; uploading required zero-byte part",
             );
             return self
@@ -533,7 +532,7 @@ impl UploadTransfer {
                         let snapshot = parts.snapshot();
                         drop(state);
                         self.inner.observability.observe_event(
-                            self.inner.ctx.id,
+                            self.ctx().id,
                             UploadEvent::CustomSourceBlocked,
                             snapshot,
                         );
@@ -546,7 +545,7 @@ impl UploadTransfer {
                 };
                 (
                     future,
-                    PartReadWake::new(self.inner.ctx.waker()),
+                    PartReadWake::new(self.ctx().waker()),
                     work.take_timing(),
                 )
             }
@@ -574,7 +573,7 @@ impl UploadTransfer {
                 let snapshot = parts.snapshot();
                 drop(state);
                 self.inner.observability.observe_source_pending(
-                    self.inner.ctx.id,
+                    self.ctx().id,
                     observation,
                     snapshot,
                 );
@@ -618,7 +617,7 @@ impl UploadTransfer {
 
         // A custom source that was blocked is available again. Refill the work withheld while the
         // retained source operation was pending so reading the next part can overlap this upload.
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
 
         self.send_part(data, timing).await
     }
@@ -638,14 +637,14 @@ impl UploadTransfer {
         };
         if transitioned {
             self.inner.observability.observe_event(
-                self.inner.ctx.id,
+                self.ctx().id,
                 UploadEvent::SourceExhausted,
                 snapshot,
             );
         }
 
         // End-of-stream may close dispatch while `poll_work` is parked behind the source gate.
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
 
         self.finish_read_without_part();
         WorkOutcome::Success { data: None }
@@ -677,7 +676,7 @@ impl UploadTransfer {
         let part_num_i32 = i32::try_from(part_number)
             .expect("part numbers are checked against 1..=10,000 before UploadPart");
         self.inner.observability.observe_part_started(
-            self.inner.ctx.id,
+            self.ctx().id,
             part_number,
             bytes_sent,
             presentation_segments,
@@ -704,7 +703,7 @@ impl UploadTransfer {
         let mut req_metrics = self
             .inner
             .observability
-            .start_request(&self.inner.ctx, UploadRequestKind::UploadPart);
+            .start_request(self.ctx(), UploadRequestKind::UploadPart);
         let retry_classify = crate::retry::classify_upload_part_retry;
         let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
             let body = sdk_body
@@ -712,8 +711,7 @@ impl UploadTransfer {
                 .expect("UploadPart SdkBody must be retryable");
             let req = copy_fields_to_upload_part_request(
                 &self.inner.request,
-                self.inner
-                    .ctx
+                self.ctx()
                     .s3_client()
                     .upload_part()
                     .upload_id(&upload_id)
@@ -723,13 +721,8 @@ impl UploadTransfer {
                 checksum.as_ref(),
             );
             async move {
-                req.customize()
-                    .config_override(
-                        self.inner
-                            .ctx
-                            .handle
-                            .upload_override(self.inner.request.bucket()),
-                    )
+                self.op()
+                    .customize(S3Request::UploadPart, req.customize())
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-upload-part", part_number))
@@ -740,7 +733,7 @@ impl UploadTransfer {
         .instrument(tracing::debug_span!(
             target: crate::telemetry::TARGET_TRANSFER,
             "upload-part",
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             part_number
         ))
         .await;
@@ -765,7 +758,7 @@ impl UploadTransfer {
                     parts.snapshot()
                 };
                 self.inner.observability.observe_part_failed(
-                    self.inner.ctx.id,
+                    self.ctx().id,
                     part_number,
                     bytes_sent,
                     presentation_segments,
@@ -798,7 +791,7 @@ impl UploadTransfer {
         };
 
         self.inner.observability.observe_part_completed(
-            self.inner.ctx.id,
+            self.ctx().id,
             part_number,
             bytes_sent,
             presentation_segments,
@@ -806,13 +799,13 @@ impl UploadTransfer {
             completion_snapshot,
         );
 
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
+        self.ctx().record_io(&crate::metrics::IoSample {
             network_tx: bytes_sent,
             ..Default::default()
         });
 
         if should_wake {
-            self.inner.ctx.try_wake();
+            self.ctx().try_wake();
         }
 
         WorkOutcome::Success { data: None }
@@ -827,7 +820,7 @@ impl UploadTransfer {
         let empty_object_ready = parts.finish_read_without_part();
         if empty_object_ready || try_begin_completing(&mut state) {
             drop(state);
-            self.inner.ctx.try_wake();
+            self.ctx().try_wake();
         }
     }
 
@@ -840,7 +833,7 @@ impl UploadTransfer {
             .expect("content length must be known for PutObject");
 
         let is_file_backed = stream.is_file_backed();
-        let direct_io = self.inner.ctx.handle.runtime.components().direct_io();
+        let direct_io = self.ctx().handle.runtime.components().direct_io();
 
         // Hand the request body off to the SDK as a retryable `SdkBody`:
         // in-memory sources ride `SdkBody::from(Bytes)`'s built-in rebuild path;
@@ -850,13 +843,13 @@ impl UploadTransfer {
         // The body must stay a native `SdkBody` (not a custom wrapper) so the SDK
         // keeps its in-memory checksum path — wrapping would force aws-chunked
         // trailer encoding and change the checksum framing.
-        let sdk_body =
-            match stream.into_sdk_body(direct_io, self.inner.ctx.handle.buffer_pool.clone()) {
-                Ok(body) => body,
-                Err(error) => return self.fail(error.into()),
-            };
+        let sdk_body = match stream.into_sdk_body(direct_io, self.ctx().handle.buffer_pool.clone())
+        {
+            Ok(body) => body,
+            Err(error) => return self.fail(error.into()),
+        };
 
-        let transfer_id = self.inner.ctx.id;
+        let transfer_id = self.ctx().id;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             tid = %transfer_id,
@@ -872,7 +865,7 @@ impl UploadTransfer {
         let mut req_metrics = self
             .inner
             .observability
-            .start_request(&self.inner.ctx, UploadRequestKind::PutObject);
+            .start_request(self.ctx(), UploadRequestKind::PutObject);
         let retry_classify = crate::retry::classify_upload_part_retry;
         let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
             let body = sdk_body
@@ -880,21 +873,14 @@ impl UploadTransfer {
                 .expect("PutObject SdkBody must be retryable");
             let put_req = copy_fields_to_put_object_request(
                 &self.inner.request,
-                self.inner
-                    .ctx
+                self.ctx()
                     .s3_client()
                     .put_object()
                     .body(ByteStream::new(body)),
             );
             async move {
-                put_req
-                    .customize()
-                    .config_override(
-                        self.inner
-                            .ctx
-                            .handle
-                            .upload_override(self.inner.request.bucket()),
-                    )
+                self.op()
+                    .customize(S3Request::PutObject, put_req.customize())
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-put-object"))
@@ -930,7 +916,7 @@ impl UploadTransfer {
         };
 
         let result = crate::sdk_v1::upload_output_from_put_object(&resp)
-            .metrics(self.inner.ctx.metrics())
+            .metrics(self.ctx().metrics())
             .build()
             .expect("valid response");
 
@@ -944,16 +930,16 @@ impl UploadTransfer {
         // anchor — "recorded when the SDK confirms success" — consistent
         // with how `network_tx` is attributed.
         let disk_read = if is_file_backed { content_length } else { 0 };
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
+        self.ctx().record_io(&crate::metrics::IoSample {
             network_tx: content_length,
             disk_read,
             ..Default::default()
         });
 
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
-        self.inner.ctx.set_completed();
+        self.ctx().set_completed();
         self.report_terminal();
-        self.inner.ctx.signal_terminal();
+        self.ctx().signal_terminal();
 
         WorkOutcome::Success { data: None }
     }
@@ -963,7 +949,7 @@ impl UploadTransfer {
             parts,
             response_builder,
         } = completion;
-        let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
+        let transfer_diagnostics = self.ctx().handle.config.diagnostics().transfer();
         let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
         let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -975,7 +961,7 @@ impl UploadTransfer {
         // The part state is held by this work item rather than by `CompleteInFlight`,
         // so its measurements come from here.
         self.inner.observability.observe_event(
-            self.inner.ctx.id,
+            self.ctx().id,
             UploadEvent::MultipartCompletionStarted,
             parts
                 .snapshot()
@@ -1000,11 +986,10 @@ impl UploadTransfer {
             Ok(object_size) => object_size,
             Err(error) => return self.fail(crate::error::invalid_input(error)),
         };
-        self.inner.ctx.set_total_bytes(object_size);
+        self.ctx().set_total_bytes(object_size);
 
         let base_req = self
-            .inner
-            .ctx
+            .ctx()
             .s3_client()
             .complete_multipart_upload()
             .upload_id(&upload_id)
@@ -1025,15 +1010,10 @@ impl UploadTransfer {
         let req_metrics = self
             .inner
             .observability
-            .start_request(&self.inner.ctx, UploadRequestKind::CompleteMultipartUpload);
-        let response = complete_req
-            .customize()
-            .config_override(
-                self.inner
-                    .ctx
-                    .handle
-                    .bucket_partition_override(self.inner.request.bucket()),
-            )
+            .start_request(self.ctx(), UploadRequestKind::CompleteMultipartUpload);
+        let response = self
+            .op()
+            .customize(S3Request::CompleteMultipartUpload, complete_req.customize())
             .send()
             .instrument(tracing::debug_span!("send-complete-multipart-upload"))
             .await;
@@ -1051,15 +1031,15 @@ impl UploadTransfer {
             response_builder,
             &resp,
         )
-        .metrics(self.inner.ctx.metrics())
+        .metrics(self.ctx().metrics())
         .build()
         .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
-        self.inner.ctx.set_completed();
+        self.ctx().set_completed();
         self.report_terminal();
-        self.inner.ctx.signal_terminal();
+        self.ctx().signal_terminal();
 
         WorkOutcome::Success { data: None }
     }
@@ -1071,9 +1051,9 @@ impl UploadTransfer {
             "upload failed",
         );
         let classification = crate::scheduler::classify_error(&error);
-        self.inner.ctx.set_failed(error);
+        self.ctx().set_failed(error);
         self.report_terminal();
-        self.inner.ctx.signal_terminal();
+        self.ctx().signal_terminal();
         WorkOutcome::Failed { classification }
     }
 }
@@ -1182,6 +1162,7 @@ impl Transfer for UploadTransfer {
 mod tests {
     use super::*;
     use crate::io::InputStream;
+    use crate::operation::OperationKind;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -1222,7 +1203,8 @@ mod tests {
             .unwrap();
         let stream = input.take_body();
 
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Upload { from_file: false }, None);
         UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
     }
 
@@ -1895,7 +1877,7 @@ mod tests {
             let mut measurement = transfer
                 .inner
                 .observability
-                .start_request(&transfer.inner.ctx, UploadRequestKind::PutObject);
+                .start_request(transfer.ctx(), UploadRequestKind::PutObject);
             measurement
                 .metrics_mut()
                 .record_retry_reissue(std::time::Duration::from_micros(3));
@@ -2116,7 +2098,8 @@ mod tests {
             .build()
             .unwrap();
         let stream = input.take_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Upload { from_file: false }, None);
         let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 
         let mut work = assert_ready(transfer.poll_work());

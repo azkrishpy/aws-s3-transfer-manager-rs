@@ -57,11 +57,10 @@ pub(crate) use transfer::DownloadTransfer;
 
 mod object_meta;
 
-use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::operation::download::body::new_recv_body;
+use crate::operation::{OperationContext, OperationKind};
 use crate::types::BucketType;
-use aws_runtime::sdk_feature::AwsSdkFeature;
 use std::sync::Arc;
 
 /// Most names tried for the temporary file of one path download.
@@ -102,8 +101,6 @@ impl Download {
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
-        use crate::transfer::TransferContext;
-
         if input.part_number().is_some() {
             todo!("single part download not implemented")
         }
@@ -113,9 +110,13 @@ impl Download {
 
         let (writer, consumer) = new_recv_body();
 
-        let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let (op, completion_rx) = OperationContext::new(
+            handle.clone(),
+            OperationKind::Download { to_file: false },
+            input.bucket(),
+        );
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        let transfer = DownloadTransfer::new(op, bucket_type, input, writer);
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -131,14 +132,14 @@ impl Download {
     /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
     /// could not be created is removed.
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
-    /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
+    /// When `parent` is `Some`, the transfer is linked as its child via
+    /// [`OperationContext::child`].
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
-        parent_id: Option<u64>,
+        parent: Option<&OperationContext>,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
@@ -156,7 +157,7 @@ impl Download {
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
-        let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, parent)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -192,17 +193,15 @@ impl Download {
     /// Shared orchestration for disk downloads: the transfer writes the object
     /// through `sink`.
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
-    /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
+    /// When `parent` is `Some`, the transfer is linked as its child via
+    /// [`OperationContext::child`].
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         sink: Box<dyn sink::SinkWrite>,
-        parent_id: Option<u64>,
+        parent: Option<&OperationContext>,
     ) -> Result<DownloadHandleInner, error::Error> {
-        use crate::transfer::TransferContext;
-
         if input.part_number().is_some() {
             todo!("single part download not implemented")
         }
@@ -212,19 +211,12 @@ impl Download {
 
         let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink);
 
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
-            None => TransferContext::new(handle.clone()),
+        let kind = OperationKind::Download { to_file: true };
+        let (op, completion_rx) = match parent {
+            Some(parent) => parent.child(kind, input.bucket()),
+            None => OperationContext::new(handle.clone(), kind, input.bucket()),
         };
-
-        let features = OperationFeatures::new(
-            parent_id
-                .map(|_| AwsSdkFeature::S3TransferDownloadDirectory)
-                .into_iter()
-                .chain([AwsSdkFeature::S3FilePath]),
-        );
-        let ctx = ctx.with_s3_client(features.apply_to_client(&handle.s3_client));
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        let transfer = DownloadTransfer::new(op, bucket_type, input, writer);
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));

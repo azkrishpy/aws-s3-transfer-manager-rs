@@ -558,8 +558,6 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
-    /// S3 client for this transfer's requests: the shared one, plus the operation's user agent features.
-    s3_client: aws_sdk_s3::Client,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -816,7 +814,6 @@ impl TransferContext {
         let ctx = Self {
             id,
             metrics: Arc::new(MetricsState::new()),
-            s3_client: handle.s3_client.clone(),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
@@ -825,12 +822,6 @@ impl TransferContext {
             pending_state,
         };
         (ctx, completion_rx)
-    }
-
-    /// Sends this transfer's requests through `s3_client` instead of the shared one.
-    pub(crate) fn with_s3_client(mut self, s3_client: aws_sdk_s3::Client) -> Self {
-        self.s3_client = s3_client;
-        self
     }
 
     /// Create a new transfer context with a specific ID (for testing).
@@ -982,7 +973,7 @@ impl TransferContext {
 
     /// The S3 client to use for SDK operations
     pub(crate) fn s3_client(&self) -> &aws_sdk_s3::Client {
-        &self.s3_client
+        &self.handle.s3_client
     }
 
     /// Mark transfer as failed and store the error.

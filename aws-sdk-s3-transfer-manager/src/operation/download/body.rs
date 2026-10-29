@@ -711,7 +711,7 @@ mod tests {
 
     fn test_body() -> (Body, DownloadTransfer, BodyWriter) {
         use crate::operation::download::DownloadInput;
-        use crate::transfer::TransferContext;
+        use crate::operation::{OperationContext, OperationKind};
         use crate::types::BucketType;
 
         let s3_client = aws_sdk_s3::Client::from_conf(
@@ -727,7 +727,11 @@ mod tests {
             .key("test")
             .build()
             .unwrap();
-        let (ctx, _) = TransferContext::new(tm.handle.clone());
+        let (ctx, _) = OperationContext::new(
+            tm.handle.clone(),
+            OperationKind::Download { to_file: false },
+            None,
+        );
         let (writer, consumer) = new_recv_body();
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone());
         (Body::new(consumer, transfer.clone()), transfer, writer)

@@ -9,8 +9,8 @@ use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
-use std::sync::Arc;
 
+use crate::operation::OperationKind;
 use crate::runtime::platform::MachineProfile;
 use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
 use crate::Config;
@@ -60,26 +60,29 @@ pub(crate) fn install(
     );
 }
 
-/// The features one operation adds to the requests it issues, on top of the client's.
-///
-/// Applied to a client derived for that operation, so they never mark the shared client.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct OperationFeatures(Arc<[AwsSdkFeature]>);
-
-impl OperationFeatures {
-    pub(crate) fn new(features: impl IntoIterator<Item = AwsSdkFeature>) -> Self {
-        Self(features.into_iter().collect())
-    }
-
-    /// A client that adds the features to every request it issues.
-    pub(crate) fn apply_to_client(&self, client: &aws_sdk_s3::Client) -> aws_sdk_s3::Client {
-        if self.0.is_empty() {
-            return client.clone();
-        }
-        let builder = client.config().to_builder().interceptor(self.clone());
-        aws_sdk_s3::Client::from_conf(builder.build())
-    }
+/// The features an operation of `kind` adds to the requests it issues, on top of the
+/// client's. A child takes its directory feature from the operation that spawned it.
+pub(crate) fn operation_features(
+    kind: OperationKind,
+    parent: Option<OperationKind>,
+) -> OperationFeatures {
+    let directory = match parent.unwrap_or(kind) {
+        OperationKind::UploadObjects => Some(AwsSdkFeature::S3TransferUploadDirectory),
+        OperationKind::DownloadObjects => Some(AwsSdkFeature::S3TransferDownloadDirectory),
+        _ => None,
+    };
+    let file = matches!(
+        kind,
+        OperationKind::Upload { from_file: true } | OperationKind::Download { to_file: true }
+    )
+    .then_some(AwsSdkFeature::S3FilePath);
+    OperationFeatures(directory.into_iter().chain(file).collect())
 }
+
+/// Adds an operation's features to each request it is attached to, so they never mark the
+/// shared client.
+#[derive(Debug)]
+pub(crate) struct OperationFeatures(Vec<AwsSdkFeature>);
 
 impl Intercept for OperationFeatures {
     fn name(&self) -> &'static str {
@@ -686,7 +689,11 @@ mod tests {
                 Box::new(|b| b.memory(MemoryConfig::Explicit(pool))),
                 &[BusinessMetric::S3CustomMemoryLimit],
             ),
-            ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &[BusinessMetric::S3OnEc2]),
+            (
+                "ec2",
+                Box::new(|b| b.machine_profile(Some(ec2))),
+                &[BusinessMetric::S3OnEc2],
+            ),
         ];
         for (name, tweak, expected) in cases {
             let expected: Vec<String> = expected.iter().cloned().map(id_of).collect();
@@ -725,14 +732,18 @@ mod tests {
         assert!(children > 0);
         for (uri, ids) in &seen[..children] {
             assert!(
-                has(ids, BusinessMetric::S3TransferUploadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
+                has(ids, BusinessMetric::S3TransferUploadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain upload from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferUploadDirectory) && !has(ids, BusinessMetric::S3FilePath),
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferUploadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }
@@ -762,20 +773,26 @@ mod tests {
         assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
         for (uri, ids) in listings {
             assert!(
-                has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && !has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         for (uri, ids) in objects {
             assert!(
-                has(ids, BusinessMetric::S3TransferDownloadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain download from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath),
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }

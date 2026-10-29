@@ -28,7 +28,6 @@ mod transfer;
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
-use crate::config::user_agent::OperationFeatures;
 use crate::error;
 pub use crate::model::builders::UploadInputBuilder;
 pub use crate::model::builders::UploadOutputBuilder;
@@ -36,9 +35,8 @@ pub use crate::model::builders::UploadOutputBuilder;
 pub use crate::model::UploadInput;
 /// Response type for uploads to Amazon S3
 pub use crate::model::UploadOutput;
-use crate::transfer::TransferContext;
+use crate::operation::{OperationContext, OperationKind};
 use crate::types::BucketType;
-use aws_runtime::sdk_feature::AwsSdkFeature;
 pub use handle::UploadHandle;
 
 use std::sync::Arc;
@@ -56,23 +54,20 @@ impl Upload {
         Self::orchestrate_inner(handle, input, None)
     }
 
-    /// Execute an `Upload` as a child of another transfer.
+    /// Execute an `Upload` as a child of `parent`.
     ///
-    /// The child's `TransferContext` is linked to `parent_id` so that
-    /// `signal_terminal` on the child wakes the parent (letting the parent's
-    /// state machine reap it) and cancelling the parent cascades to this child.
+    /// See [`OperationContext::child`] for how the two are linked.
     pub(crate) fn orchestrate_child(
-        handle: Arc<crate::client::Handle>,
+        parent: &OperationContext,
         input: crate::operation::upload::UploadInput,
-        parent_id: u64,
     ) -> Result<UploadHandle, error::Error> {
-        Self::orchestrate_inner(handle, input, Some(parent_id))
+        Self::orchestrate_inner(parent.transfer().handle.clone(), input, Some(parent))
     }
 
     fn orchestrate_inner(
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
-        parent_id: Option<u64>,
+        parent: Option<&OperationContext>,
     ) -> Result<UploadHandle, error::Error> {
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
@@ -95,22 +90,14 @@ impl Upload {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        // Create transfer context — linked to parent when this is a child
-        // transfer, so signal_terminal wakes the parent and cancellation
-        // cascades from the parent.
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
-            None => TransferContext::new(handle.clone()),
+        let kind = OperationKind::Upload {
+            from_file: stream.is_file_backed(),
         };
-
-        let features = OperationFeatures::new(
-            parent_id
-                .map(|_| AwsSdkFeature::S3TransferUploadDirectory)
-                .into_iter()
-                .chain(stream.is_file_backed().then_some(AwsSdkFeature::S3FilePath)),
-        );
-        let ctx = ctx.with_s3_client(features.apply_to_client(&handle.s3_client));
-        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream)?;
+        let (op, completion_rx) = match parent {
+            Some(parent) => parent.child(kind, input.bucket()),
+            None => OperationContext::new(handle.clone(), kind, input.bucket()),
+        };
+        let transfer = UploadTransfer::try_new(op, bucket_type, input, stream)?;
 
         handle
             .scheduler

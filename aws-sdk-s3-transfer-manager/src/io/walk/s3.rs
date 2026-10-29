@@ -150,6 +150,7 @@ impl S3Walker {
             config: self,
             client: ctx.client,
             bucket: ctx.bucket,
+            request_override: ctx.request_override,
             pending_prefixes,
             ready_objects: VecDeque::new(),
             current_prefix: None,
@@ -283,6 +284,7 @@ impl S3WalkerBuilder {
 pub struct S3WalkContext {
     client: S3WalkServiceClient,
     bucket: crate::types::Bucket,
+    request_override: Option<aws_sdk_s3::config::Builder>,
 }
 
 impl std::fmt::Debug for S3WalkContext {
@@ -300,6 +302,7 @@ impl S3WalkContext {
         S3WalkContextBuilder {
             client: None,
             bucket: None,
+            request_override: None,
         }
     }
 }
@@ -309,6 +312,7 @@ impl S3WalkContext {
 pub struct S3WalkContextBuilder {
     client: Option<S3WalkServiceClient>,
     bucket: Option<String>,
+    request_override: Option<aws_sdk_s3::config::Builder>,
 }
 
 impl S3WalkContextBuilder {
@@ -339,6 +343,15 @@ impl S3WalkContextBuilder {
         self
     }
 
+    /// Applied to every `ListObjectsV2` request the walk sends.
+    pub(crate) fn request_override(
+        mut self,
+        request_override: aws_sdk_s3::config::Builder,
+    ) -> Self {
+        self.request_override = Some(request_override);
+        self
+    }
+
     /// Set the bucket to list.
     ///
     /// This field is required.
@@ -359,6 +372,7 @@ impl S3WalkContextBuilder {
         S3WalkContext {
             client: self.client.expect("required field `client` should be set"),
             bucket: crate::types::Bucket::new(bucket_name),
+            request_override: self.request_override,
         }
     }
 }
@@ -372,6 +386,7 @@ pub struct S3Walk {
     config: S3Walker,
     client: S3WalkServiceClient,
     bucket: crate::types::Bucket,
+    request_override: Option<aws_sdk_s3::config::Builder>,
     pending_prefixes: VecDeque<String>,
     ready_objects: VecDeque<Object>,
     current_prefix: Option<String>,
@@ -520,6 +535,10 @@ impl S3Walk {
             req = req.max_keys(page_size);
         }
 
+        let mut req = req.customize();
+        if let Some(request_override) = &self.request_override {
+            req = req.config_override(request_override.clone());
+        }
         let output = req
             .send()
             .await

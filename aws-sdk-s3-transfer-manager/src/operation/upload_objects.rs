@@ -21,7 +21,7 @@ pub(crate) use transfer::UploadObjectsTransfer;
 use std::sync::Arc;
 
 use crate::io::walk::FsWalkContext;
-use crate::transfer::TransferContext;
+use crate::operation::{OperationContext, OperationKind};
 
 /// Operation struct for uploading multiple objects to Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -42,9 +42,10 @@ impl UploadObjects {
         let walker = input.walker().cloned().unwrap_or_default();
         let walk = walker.walk(FsWalkContext::builder().root(source).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let (op, completion_rx) =
+            OperationContext::new(handle.clone(), OperationKind::UploadObjects, input.bucket());
 
-        let transfer = UploadObjectsTransfer::new(ctx, input, walk);
+        let transfer = UploadObjectsTransfer::new(op, input, walk);
 
         handle
             .scheduler
