@@ -31,6 +31,7 @@ use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
 use crate::operation::download::ChunkMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::download::ObjectMetadata;
+use crate::operation::{OperationContext, S3Request};
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
@@ -51,7 +52,7 @@ pub(crate) struct DownloadTransfer {
 #[derive(Debug)]
 struct DownloadTransferInner {
     /// Common transfer lifecycle management
-    ctx: TransferContext,
+    op: OperationContext,
     /// State machine for work progression
     state: Mutex<DownloadState>,
     /// Direction-specific observation kept outside correctness state.
@@ -95,7 +96,7 @@ pub(crate) enum DownloadWork {
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
     ($self:expr) => {
-        if !$self.inner.ctx.is_active() {
+        if !$self.ctx().is_active() {
             // Bailing before any drain: no occupancy freed on this path. The transfer is
             // no longer active, so a completion this retirement claims is dropped rather
             // than finalized: the cancellation's terminal path owns the destination (see
@@ -108,15 +109,17 @@ macro_rules! bail_if_terminal {
 
 impl DownloadTransfer {
     pub(crate) fn new(
-        ctx: TransferContext,
+        op: OperationContext,
         bucket_type: BucketType,
         input: DownloadInput,
         writer: BodyWriter,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
-        // to a window in parts before `ctx` and `input` are moved into the struct.
-        let window =
-            super::read_ahead::resolve_window(input.read_ahead(), ctx.handle.config.read_ahead());
+        // to a window in parts before `op` and `input` are moved into the struct.
+        let window = super::read_ahead::resolve_window(
+            input.read_ahead(),
+            op.transfer().handle.config.read_ahead(),
+        );
         let read_ahead = ReadAhead::with_window(window);
         // Couple the disk drain batch to the initial window, so a window below the
         // segment size drains in smaller runs from the first part.
@@ -126,11 +129,13 @@ impl DownloadTransfer {
         } else {
             DownloadDestination::Stream
         };
-        let observability =
-            DownloadObservability::new(ctx.handle.config.diagnostics().transfer(), destination);
+        let observability = DownloadObservability::new(
+            op.transfer().handle.config.diagnostics().transfer(),
+            destination,
+        );
         let inner = Arc::new(DownloadTransferInner {
             read_ahead,
-            ctx,
+            op,
             state: Mutex::new(DownloadState::new()),
             observability,
             request: Arc::new(input),
@@ -146,14 +151,16 @@ impl DownloadTransfer {
 
     /// Access the transfer context.
     pub(crate) fn ctx(&self) -> &TransferContext {
-        &self.inner.ctx
+        self.inner.op.transfer()
+    }
+
+    pub(crate) fn op(&self) -> &OperationContext {
+        &self.inner.op
     }
 
     /// Starts one request measurement attributed to download request kind.
     pub(crate) fn start_request(&self, kind: DownloadRequestKind) -> DownloadRequestMeasurement {
-        self.inner
-            .observability
-            .start_request(&self.inner.ctx, kind)
+        self.inner.observability.start_request(self.ctx(), kind)
     }
 
     fn snapshot(&self, state: &DownloadState) -> DownloadStateSnapshot {
@@ -164,16 +171,16 @@ impl DownloadTransfer {
         let snapshot = self.snapshot(state);
         self.inner
             .observability
-            .observe_event(self.inner.ctx.id, event, snapshot);
+            .observe_event(self.ctx().id, event, snapshot);
     }
 
     /// Emits the download terminal summary before notifying the owning handle.
     fn report_terminal(&self, state_snapshot: DownloadStateSnapshot) {
-        self.inner.ctx.finalize_terminal_metrics();
-        if !self.inner.ctx.claim_terminal_report() {
+        self.ctx().finalize_terminal_metrics();
+        if !self.ctx().claim_terminal_report() {
             return;
         }
-        let pending = self.inner.ctx.pending_stats().unwrap_or_default();
+        let pending = self.ctx().pending_stats().unwrap_or_default();
         let checksum_validation = self
             .inner
             .integrity_checks
@@ -183,11 +190,11 @@ impl DownloadTransfer {
             .inner
             .observability
             .report_terminal(DownloadTerminalReport {
-                transfer_id: self.inner.ctx.id,
-                status: self.inner.ctx.transfer_status(),
-                error_kind: self.inner.ctx.error_kind(),
-                metrics: self.inner.ctx.metrics(),
-                request_total: self.inner.ctx.metrics.request_metrics(),
+                transfer_id: self.ctx().id,
+                status: self.ctx().transfer_status(),
+                error_kind: self.ctx().error_kind(),
+                metrics: self.ctx().metrics(),
+                request_total: self.ctx().metrics.request_metrics(),
                 pending,
                 checksum_validation,
                 state_snapshot,
@@ -196,7 +203,7 @@ impl DownloadTransfer {
 
     /// Get the transfer ID.
     pub(crate) fn id(&self) -> TransferId {
-        self.inner.ctx.id
+        self.ctx().id
     }
 
     /// Body writer for chunk delivery and disk writes.
@@ -261,7 +268,7 @@ impl DownloadTransfer {
             }
             // Terminal (or pre-transfer): no gate to release.
         }
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
     }
 
     /// Object metadata from discovery.
@@ -312,7 +319,7 @@ impl DownloadTransfer {
     /// [`DownloadState`] describes.
     #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {
-        if !self.inner.ctx.is_active() {
+        if !self.ctx().is_active() {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
@@ -328,7 +335,7 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
-                self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
+                self.ctx().set_pending(DownloadPendingReason::Discovery);
                 self.inner
                     .observability
                     .observe_state(self.snapshot(&state));
@@ -508,13 +515,13 @@ impl DownloadTransfer {
                 );
                 self.inner.observability.record_range_scheduled();
                 self.inner.observability.observe_event(
-                    self.inner.ctx.id,
+                    self.ctx().id,
                     DownloadEvent::RangeScheduled,
                     snapshot,
                 );
                 if all_ranges_issued {
                     self.inner.observability.observe_event(
-                        self.inner.ctx.id,
+                        self.ctx().id,
                         DownloadEvent::AllRangesIssued,
                         snapshot,
                     );
@@ -537,7 +544,7 @@ impl DownloadTransfer {
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
-        self.inner.ctx.set_pending(reason);
+        self.ctx().set_pending(reason);
         self.inner.observability.observe_state(snapshot);
         PollWork::Pending
     }
@@ -570,7 +577,7 @@ impl DownloadTransfer {
         if *drains_in_flight == 0 && self.inner.writer.has_drainable_resident() {
             *drains_in_flight += 1;
             self.inner.observability.observe_event(
-                self.inner.ctx.id,
+                self.ctx().id,
                 DownloadEvent::MemoryReliefScheduled,
                 snapshot,
             );
@@ -578,8 +585,7 @@ impl DownloadTransfer {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
-            self.inner
-                .ctx
+            self.ctx()
                 .set_pending(DownloadPendingReason::MemoryAdmission);
             self.inner.observability.observe_state(snapshot);
             PollWork::Pending
@@ -595,7 +601,7 @@ impl DownloadTransfer {
         &self,
         pending: &mut Option<PendingClaim>,
     ) -> Result<Option<BodySlot>, ReserveError> {
-        let waker = self.inner.ctx.waker();
+        let waker = self.ctx().waker();
         let mut context = Context::from_waker(&waker);
         let reservation =
             match Pin::new(&mut pending.as_mut().unwrap().reservation).poll(&mut context) {
@@ -619,8 +625,8 @@ impl DownloadTransfer {
         pending: &mut Option<PendingClaim>,
     ) -> Result<Option<BodySlot>, ReserveError> {
         let mut slot = self.inner.writer.claim();
-        let mut reservation = self.inner.ctx.handle.buffer_pool.reserve(range_len);
-        let waker = self.inner.ctx.waker();
+        let mut reservation = self.ctx().handle.buffer_pool.reserve(range_len);
+        let waker = self.ctx().waker();
         let mut context = Context::from_waker(&waker);
 
         match Pin::new(&mut reservation).poll(&mut context) {
@@ -650,19 +656,19 @@ impl DownloadTransfer {
         &self,
         len: usize,
     ) -> Result<Option<Reservation>, ReserveError> {
-        let mut reservation = std::pin::pin!(self.inner.ctx.handle.buffer_pool.reserve(len));
+        let mut reservation = std::pin::pin!(self.ctx().handle.buffer_pool.reserve(len));
 
         loop {
             let terminal_wake = self.inner.discovery_notify.notified();
             let terminal_wake = std::pin::pin!(terminal_wake);
-            if !self.inner.ctx.is_active() {
+            if !self.ctx().is_active() {
                 return Ok(None);
             }
             match select(reservation.as_mut(), terminal_wake).await {
                 Either::Left((result, _)) => {
                     tracing::debug!(
                         target: crate::telemetry::TARGET_SCHEDULING,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         len,
                         "discovery chunk reservation granted; resuming",
                     );
@@ -733,7 +739,7 @@ impl DownloadTransfer {
         // `drains_in_flight`. A status off `Active` with the state still
         // `Transferring` means the terminal transition is under way, and its
         // terminal drain takes the resident run.
-        if !self.inner.ctx.is_active() {
+        if !self.ctx().is_active() {
             return WorkOutcome::Cancelled;
         }
 
@@ -764,14 +770,14 @@ impl DownloadTransfer {
             .observability
             .record_memory_relief_completed(drained.parts);
         self.inner.observability.observe_event(
-            self.inner.ctx.id,
+            self.ctx().id,
             DownloadEvent::MemoryReliefCompleted,
             snapshot,
         );
         if let Some(claim) = completion {
             return self.finalize_completion(claim);
         }
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
         WorkOutcome::Success { data: None }
     }
 
@@ -846,7 +852,7 @@ impl DownloadTransfer {
         }
         self.inner.observability.destination_prepared();
         let _ = self.inner.expected_download_len.set(expected_download_len);
-        self.inner.ctx.set_total_bytes(expected_download_len);
+        self.ctx().set_total_bytes(expected_download_len);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -914,7 +920,7 @@ impl DownloadTransfer {
             // With no chunk and nothing remaining, discovery is the last work item to
             // retire, so it claims completion under the lock that publishes the state.
             // A transfer that is no longer active is not completed.
-            let completion = if self.inner.ctx.is_active() {
+            let completion = if self.ctx().is_active() {
                 work.try_claim_completion()
             } else {
                 None
@@ -925,13 +931,13 @@ impl DownloadTransfer {
             self.inner.observability.record_range_scheduled();
         }
         self.inner.observability.observe_event(
-            self.inner.ctx.id,
+            self.ctx().id,
             DownloadEvent::DiscoveryCompleted,
             discovery_snapshot,
         );
         if all_ranges_issued {
             self.inner.observability.observe_event(
-                self.inner.ctx.id,
+                self.ctx().id,
                 DownloadEvent::AllRangesIssued,
                 discovery_snapshot,
             );
@@ -942,7 +948,7 @@ impl DownloadTransfer {
         }
 
         // State changed from DiscoveryInFlight - try to wake
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
 
         // If discovery returned an initial chunk, process it
         match initial_work {
@@ -986,7 +992,7 @@ impl DownloadTransfer {
             .and_then(crate::http::header::parse_content_range);
 
         let mut initial = Some(stream);
-        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        let recv_latencies = &self.ctx().handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
@@ -997,7 +1003,7 @@ impl DownloadTransfer {
         let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
-            let ctx = self.inner.ctx.clone();
+            let ctx = self.ctx().clone();
             let reissue_range = reissue_range.clone();
             let mut builder =
                 copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
@@ -1007,9 +1013,9 @@ impl DownloadTransfer {
             if let Some(etag) = etag.as_ref() {
                 builder = builder.if_match(etag.as_ref());
             }
-            let req = builder
-                .customize()
-                .config_override(ctx.handle.download_get_override(input.bucket()));
+            let req = self
+                .op()
+                .customize(S3Request::GetObjectRange, builder.customize());
             async move {
                 // Obtain the body stream. First attempt reuses the discovery body
                 // (no send, untimed); a re-issue is TTFB-guarded (times + records).
@@ -1107,7 +1113,7 @@ impl DownloadTransfer {
 
         let bytes_received =
             u64::try_from(expected_len).expect("validated discovery length originated from u64");
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
+        self.ctx().record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
@@ -1147,7 +1153,7 @@ impl DownloadTransfer {
         };
         let reservation = slot.reservation();
 
-        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        let recv_latencies = &self.ctx().handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (send → headers ≈ TTFB): the
         // `recv_latencies.guarded(send)` wrapper times the send, then the body is
         // read UNTIMED. A large part on a slow-but-healthy link takes a long time
@@ -1161,7 +1167,7 @@ impl DownloadTransfer {
             crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
                 let rh = range_header.clone();
                 let etag = etag.clone();
-                let ctx = self.inner.ctx.clone();
+                let ctx = self.ctx().clone();
                 // Every chunk GET must carry the same request fields as discovery
                 // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
                 // conversion, then pin this chunk's range and the discovered etag.
@@ -1171,9 +1177,9 @@ impl DownloadTransfer {
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
-                let req = builder
-                    .customize()
-                    .config_override(ctx.handle.download_get_override(input.bucket()));
+                let req = self
+                    .op()
+                    .customize(S3Request::GetObjectRange, builder.customize());
                 async move {
                     // Timed (TTFB): obtain response headers. Validate the range here
                     // so a mismatch is classified before we commit to the body read.
@@ -1246,7 +1252,7 @@ impl DownloadTransfer {
 
         let bytes_received =
             u64::try_from(expected_len).expect("validated range length originated from u64");
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
+        self.ctx().record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
@@ -1312,7 +1318,7 @@ impl DownloadTransfer {
         if let Some(snapshot) = snapshot {
             self.inner.observability.record_range_completed(freed);
             self.inner.observability.observe_event(
-                self.inner.ctx.id,
+                self.ctx().id,
                 DownloadEvent::RangeCompleted,
                 snapshot,
             );
@@ -1320,7 +1326,7 @@ impl DownloadTransfer {
         // Wake the issuer on every non-terminal completion so a pending poll_work can
         // issue more. A claimed completion is finalized by the caller in `execute`.
         if completion.is_none() {
-            self.inner.ctx.try_wake();
+            self.ctx().try_wake();
         }
         completion
     }
@@ -1352,15 +1358,15 @@ impl DownloadTransfer {
         };
         if self.inner.writer.has_sink() {
             self.inner.observability.observe_event(
-                self.inner.ctx.id,
+                self.ctx().id,
                 DownloadEvent::DestinationFinalized,
                 state_snapshot,
             );
         }
-        self.inner.ctx.set_completed();
+        self.ctx().set_completed();
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
-        self.inner.ctx.signal_terminal();
+        self.ctx().signal_terminal();
         WorkOutcome::Success { data: None }
     }
 
@@ -1378,8 +1384,8 @@ impl DownloadTransfer {
         );
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
-        if !self.inner.ctx.set_failed(error)
-            && self.inner.ctx.transfer_status() == crate::types::TransferStatus::Completed
+        if !self.ctx().set_failed(error)
+            && self.ctx().transfer_status() == crate::types::TransferStatus::Completed
         {
             // Unreachable under the counting rule on `DownloadState`: `fail`
             // runs from a work item that is still counted, from discovery
@@ -1394,7 +1400,7 @@ impl DownloadTransfer {
             );
             tracing::error!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 error = %description,
                 "download failed after it had completed; the failure is not reported to the caller",
             );
@@ -1410,7 +1416,7 @@ impl DownloadTransfer {
         self.run_terminal_drain();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
-        self.inner.ctx.signal_terminal();
+        self.ctx().signal_terminal();
         WorkOutcome::Failed { classification }
     }
 
@@ -1418,7 +1424,7 @@ impl DownloadTransfer {
     /// nothing.
     fn record_disk_write(&self, bytes: u64) {
         if bytes > 0 {
-            self.inner.ctx.record_io(&crate::metrics::IoSample {
+            self.ctx().record_io(&crate::metrics::IoSample {
                 disk_write: bytes,
                 ..Default::default()
             });
@@ -1741,8 +1747,8 @@ mod tests {
         object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
+    use crate::operation::{OperationContext, OperationKind};
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::transfer::TransferContext;
     use crate::transfer::WorkOutcome;
     use crate::types::{BucketType, ChecksumValidation, NotValidatedReason};
     use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -2157,7 +2163,8 @@ mod tests {
             .unwrap();
 
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
@@ -2447,7 +2454,8 @@ mod tests {
             .unwrap();
 
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
         assert_discovery_succeeds(&transfer).await;
@@ -2754,7 +2762,8 @@ mod tests {
             .build()
             .unwrap();
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
         assert_discovery_succeeds(&transfer).await;
@@ -2845,7 +2854,8 @@ mod tests {
             .unwrap();
 
         let (writer, consumer) = crate::operation::download::body::new_recv_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
         (transfer, consumer)
     }
@@ -3228,7 +3238,8 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, false);
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
@@ -3724,7 +3735,6 @@ mod tests {
             Arc::clone(&handle),
             input,
             dest.clone(),
-            None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
         .await
@@ -4142,7 +4152,8 @@ mod tests {
                 .build()
                 .unwrap();
             let (writer, _consumer) = crate::operation::download::body::new_recv_body();
-            let (ctx, _rx) = TransferContext::new(handle);
+            let (ctx, _rx) =
+                OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
             DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
         };
 

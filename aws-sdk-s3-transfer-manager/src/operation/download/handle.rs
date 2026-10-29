@@ -503,7 +503,7 @@ mod tests {
     use crate::operation::download::body::{new_recv_body, RecvBodyConsumer};
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
-    use crate::transfer::TransferContext;
+    use crate::operation::{OperationContext, OperationKind};
     use crate::types::BucketType;
 
     fn is_send<T: Send>() {}
@@ -537,11 +537,12 @@ mod tests {
             .build()
             .unwrap();
         let (writer, consumer) = new_recv_body();
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
-        ctx.set_cancelled();
-        ctx.signal_terminal();
+        transfer.ctx().set_cancelled();
+        transfer.ctx().signal_terminal();
 
         let inner = DownloadHandleInner {
             transfer,

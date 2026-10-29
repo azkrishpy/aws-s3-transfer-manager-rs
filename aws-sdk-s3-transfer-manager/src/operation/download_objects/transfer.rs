@@ -23,6 +23,7 @@ use crate::io::walk::S3Walk;
 use crate::model::Object;
 use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
+use crate::operation::OperationContext;
 use crate::transfer::{
     IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
 };
@@ -128,7 +129,7 @@ impl Drop for Reservation {
             state.children_reserved = state.children_reserved.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.transfer.ctx.id,
+                tid = %self.transfer.op.transfer().id,
                 count = self.count,
                 "Reservation dropped unconsumed; children_reserved recovered"
             );
@@ -201,7 +202,7 @@ impl Drop for ReapingBatch {
             state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.transfer.ctx.id,
+                tid = %self.transfer.op.transfer().id,
                 count = self.count,
                 "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
             );
@@ -255,7 +256,7 @@ impl std::fmt::Debug for DownloadObjectsTransfer {
 }
 
 struct DownloadObjectsTransferInner {
-    ctx: TransferContext,
+    op: OperationContext,
     state: Mutex<State>,
     bucket: String,
     destination: PathBuf,
@@ -270,7 +271,7 @@ struct DownloadObjectsTransferInner {
 
 impl DownloadObjectsTransfer {
     pub(crate) fn new(
-        ctx: TransferContext,
+        op: OperationContext,
         input: &crate::operation::download_objects::DownloadObjectsInput,
         walk: S3Walk,
         pipeline_depth: usize,
@@ -283,7 +284,7 @@ impl DownloadObjectsTransfer {
 
         Self {
             inner: Arc::new(DownloadObjectsTransferInner {
-                ctx,
+                op,
                 state: Mutex::new(State {
                     walk: Some(walk),
                     validated: false,
@@ -306,7 +307,7 @@ impl DownloadObjectsTransfer {
         }
     }
     pub(crate) fn ctx(&self) -> &TransferContext {
-        &self.inner.ctx
+        self.inner.op.transfer()
     }
 
     pub(crate) fn successful_downloads(&self) -> u64 {
@@ -346,7 +347,7 @@ impl DownloadObjectsTransfer {
         // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
         // tops off the key buffer ahead of spawn draining it rather than
         // waiting until empty, avoiding stalls on ListObjectsV2 page latency.
-        if self.inner.ctx.is_active() {
+        if self.ctx().is_active() {
             if let Some(work) = self.dispatch_walk(&mut state) {
                 return work;
             }
@@ -364,7 +365,7 @@ impl DownloadObjectsTransfer {
         // spawn vruntime charge, so a failed orchestration is not charged.
         let mut attempted = false;
         let mut materialized = false;
-        if self.inner.ctx.is_active() {
+        if self.ctx().is_active() {
             let (to_spawn, reservation) = self.claim_one(&mut state);
             if !to_spawn.is_empty() {
                 attempted = true;
@@ -400,8 +401,7 @@ impl DownloadObjectsTransfer {
         if let Some(result) = self.check_terminal(&state) {
             return result;
         }
-        self.inner
-            .ctx
+        self.ctx()
             .set_pending(PendingCause::in_flight_work("bulk_work_completion"));
         PollWork::Pending
     }
@@ -428,7 +428,7 @@ impl DownloadObjectsTransfer {
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             reaping = batch.len(),
             remaining_children = state.children.len(),
             "download_objects draining terminal children",
@@ -474,12 +474,9 @@ impl DownloadObjectsTransfer {
     }
 
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
-        let handle = &self.inner.ctx.handle;
-        let parent_id = self.inner.ctx.id.id;
-
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             count = entries.len(),
             "download_objects spawning children",
         );
@@ -491,7 +488,7 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
+                let result = self.spawn_single_child(&key);
                 (obj, result.map(|h| ChildTransfer { handle: h, key }))
             })
             .collect()
@@ -506,12 +503,7 @@ impl DownloadObjectsTransfer {
         crate::operation::validate_target_is_dir(&metadata, dest)
     }
 
-    fn spawn_single_child(
-        &self,
-        handle: &Arc<crate::client::Handle>,
-        key: &str,
-        parent_id: u64,
-    ) -> Result<ManagedDownloadHandle, Error> {
+    fn spawn_single_child(&self, key: &str) -> Result<ManagedDownloadHandle, Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
             key,
@@ -571,7 +563,12 @@ impl DownloadObjectsTransfer {
             )
         })?;
 
-        let inner = Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id))?;
+        let inner = Download::orchestrate_with_sink(
+            self.ctx().handle.clone(),
+            input,
+            sink,
+            Some(&self.inner.op),
+        )?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -619,7 +616,7 @@ impl DownloadObjectsTransfer {
                         // `source()` is only this string. Connecting the root
                         // `source()` to the failing child's error needs a
                         // shareable error (`Arc`) since `Error` is not `Clone`.
-                        self.inner.ctx.set_failed_and_signal(Error::new(
+                        self.ctx().set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
@@ -634,7 +631,7 @@ impl DownloadObjectsTransfer {
     }
 
     fn check_terminal(&self, state: &State) -> Option<PollWork> {
-        if !self.inner.ctx.is_active() {
+        if !self.ctx().is_active() {
             // Wait for all in-flight work to drain
             if state.children.is_empty()
                 && state.children_reserved == 0
@@ -643,12 +640,12 @@ impl DownloadObjectsTransfer {
             {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    tid = %self.inner.ctx.id,
+                    tid = %self.ctx().id,
                     successful = state.successful_downloads,
                     failed = state.failed.len(),
                     "download_objects terminal (cancelled/failed), signaling",
                 );
-                self.inner.ctx.signal_terminal();
+                self.ctx().signal_terminal();
                 return Some(PollWork::Done);
             }
             return None;
@@ -664,7 +661,7 @@ impl DownloadObjectsTransfer {
         {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 successful = state.successful_downloads,
                 failed = state.failed.len(),
                 "download_objects terminal (walk exhausted), signaling",
@@ -672,8 +669,8 @@ impl DownloadObjectsTransfer {
             // The success transition: status is still Active here (the
             // !is_active() branch above handles an already-terminal drain after
             // set_failed/set_cancelled, where completing would be wrong).
-            self.inner.ctx.set_completed();
-            self.inner.ctx.signal_terminal();
+            self.ctx().set_completed();
+            self.ctx().signal_terminal();
             return Some(PollWork::Done);
         }
 
@@ -754,12 +751,12 @@ impl DownloadObjectsTransfer {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
                 // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
-                self.inner.ctx.set_failed(err);
+                self.ctx().set_failed(err);
                 if self.check_terminal(&state).is_some() {
                     return WorkOutcome::Success { data: None };
                 }
                 drop(state);
-                self.inner.ctx.try_wake();
+                self.ctx().try_wake();
                 return WorkOutcome::Success { data: None };
             }
         }
@@ -784,7 +781,7 @@ impl DownloadObjectsTransfer {
                         drop(state);
                         // Wake so a spawn poll runs against the just-published
                         // keys without waiting for this advance to complete.
-                        self.inner.ctx.try_wake();
+                        self.ctx().try_wake();
                     }
                     // Limit to one page worth of results per work item so we
                     // don't hold the executor across multiple ListObjectsV2
@@ -801,7 +798,7 @@ impl DownloadObjectsTransfer {
                     // Non-fatal errors: log and continue
                     tracing::warn!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         error = %err,
                         "non-fatal walker error, continuing"
                     );
@@ -817,15 +814,15 @@ impl DownloadObjectsTransfer {
         if let Some(err) = fatal_error {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 error = %err,
                 "download_objects fatal walker error",
             );
-            self.inner.ctx.set_failed(err);
+            self.ctx().set_failed(err);
         } else {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 discovered,
                 walk_done = walk.is_done(),
                 "download_objects walker advanced",
@@ -846,7 +843,7 @@ impl DownloadObjectsTransfer {
 
         drop(state);
         // Wake: new entries in pending_entries unblock poll_work from Pending.
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
         WorkOutcome::Success { data: None }
     }
 
@@ -866,7 +863,7 @@ impl DownloadObjectsTransfer {
                     // context, which already updated the client-level counters
                     // during the child transfer) so DownloadObjectsOutput.metrics
                     // reflects the whole directory download without double-counting.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
+                    self.ctx().metrics.record_io(&crate::metrics::IoSample {
                         network_tx: metrics.network_tx,
                         network_rx: metrics.network_rx,
                         disk_read: metrics.disk_read,
@@ -891,7 +888,7 @@ impl DownloadObjectsTransfer {
                         // `source()` is only this string. Connecting the root
                         // `source()` to the failing child's error needs a
                         // shareable error (`Arc`) since `Error` is not `Clone`.
-                        self.inner.ctx.set_failed_and_signal(Error::new(
+                        self.ctx().set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
@@ -911,14 +908,14 @@ impl DownloadObjectsTransfer {
         }
         drop(state);
         // Wake: freed pipeline capacity may unblock dispatch_walk or spawning.
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
         WorkOutcome::Success { data: None }
     }
 }
 
 impl Transfer for DownloadObjectsTransfer {
     fn ctx(&self) -> &TransferContext {
-        &self.inner.ctx
+        self.ctx()
     }
 
     fn poll_work(&self) -> PollWork {
@@ -999,7 +996,7 @@ fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Er
 mod tests {
     use super::*;
     use crate::io::walk::{S3WalkContext, S3Walker};
-    use crate::transfer::TransferContext;
+    use crate::operation::{OperationContext, OperationKind};
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_sdk_s3::types::Object;
@@ -1076,10 +1073,12 @@ mod tests {
                 .build(),
         );
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        ctx.handle
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::DownloadObjects, None);
+        ctx.transfer()
+            .handle
             .scheduler
-            .register_empty_group_for_test(ctx.id.id);
+            .register_empty_group_for_test(ctx.transfer().id.id);
 
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")
@@ -1124,7 +1123,8 @@ mod tests {
                 .build(),
         );
 
-        let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let (ctx, completion_rx) =
+            OperationContext::new(handle.clone(), OperationKind::DownloadObjects, None);
 
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")
@@ -1335,7 +1335,7 @@ mod tests {
         .expect("transfer should complete within timeout");
 
         assert_eq!(transfer.successful_downloads(), 0);
-        assert!(transfer.inner.ctx.is_failed());
+        assert!(transfer.ctx().is_failed());
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1356,7 +1356,7 @@ mod tests {
         .await
         .expect("transfer should complete within timeout");
 
-        assert!(transfer.inner.ctx.is_failed());
+        assert!(transfer.ctx().is_failed());
         assert_eq!(transfer.successful_downloads(), 0);
     }
 
@@ -1480,10 +1480,12 @@ mod tests {
                 .build(),
         );
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        ctx.handle
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::DownloadObjects, None);
+        ctx.transfer()
+            .handle
             .scheduler
-            .register_empty_group_for_test(ctx.id.id);
+            .register_empty_group_for_test(ctx.transfer().id.id);
 
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")
@@ -1597,7 +1599,7 @@ mod tests {
         let (transfer, _completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
         // Cancel after first poll_work cycle
-        transfer.inner.ctx.set_cancelled();
+        transfer.ctx().set_cancelled();
 
         timeout(Duration::from_secs(10), async {
             drive_transfer(&transfer).await;
@@ -1605,7 +1607,7 @@ mod tests {
         .await
         .expect("cancelled transfer should terminate");
 
-        assert!(!transfer.inner.ctx.is_active());
+        assert!(!transfer.ctx().is_active());
     }
 
     // --- Managed-runtime tests ---
@@ -2136,10 +2138,12 @@ mod tests {
                 .build(),
         );
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        ctx.handle
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::DownloadObjects, None);
+        ctx.transfer()
+            .handle
             .scheduler
-            .register_empty_group_for_test(ctx.id.id);
+            .register_empty_group_for_test(ctx.transfer().id.id);
 
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")

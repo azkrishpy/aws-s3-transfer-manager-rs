@@ -17,6 +17,7 @@ use super::DownloadInput;
 use super::{ChunkMetadata, ObjectMetadata};
 use crate::error;
 use crate::http::header::{self, ByteRange};
+use crate::operation::S3Request;
 use crate::sdk_v1::{
     copy_download_input_fields_to_get_object as copy_fields_to_get_object_request,
     copy_download_input_fields_to_head_object as copy_fields_to_head_object_request,
@@ -181,16 +182,8 @@ async fn discover_obj_with_get_first_part(
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
-        let req = builder
-            .set_range(None)
-            .set_part_number(Some(1))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
+        let req = builder.set_range(None).set_part_number(Some(1)).customize();
+        let req = transfer.op().customize(S3Request::GetObjectDiscovery, req);
         async move {
             req.send()
                 .await
@@ -217,13 +210,8 @@ async fn discover_obj_with_head(
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let req =
             copy_fields_to_head_object_request(input, transfer.ctx().s3_client().head_object())
-                .customize()
-                .config_override(
-                    transfer
-                        .ctx()
-                        .handle
-                        .bucket_partition_override(input.bucket()),
-                );
+                .customize();
+        let req = transfer.op().customize(S3Request::HeadObject, req);
         async move {
             req.send()
                 .await
@@ -378,13 +366,8 @@ async fn discover_obj_with_get(
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
         let req = builder
             .range(header::Range::bytes(byte_range.clone()))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
+            .customize();
+        let req = transfer.op().customize(S3Request::GetObjectDiscovery, req);
         async move {
             req.send()
                 .await
@@ -540,7 +523,7 @@ mod tests {
     };
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
-    use crate::transfer::TransferContext;
+    use crate::operation::{OperationContext, OperationKind};
     use crate::types::BucketType;
     use crate::types::PartSize;
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -589,7 +572,8 @@ mod tests {
     ) -> DownloadTransfer {
         use crate::operation::download::body;
         let (writer, _consumer) = body::new_recv_body();
-        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let (ctx, _completion_rx) =
+            OperationContext::new(handle, OperationKind::Download { to_file: false }, None);
         DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
     }
 

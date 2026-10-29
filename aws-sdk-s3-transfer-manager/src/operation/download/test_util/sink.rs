@@ -509,7 +509,6 @@ mod tests {
             Arc::clone(&handle),
             input,
             dest.clone(),
-            None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
         .await

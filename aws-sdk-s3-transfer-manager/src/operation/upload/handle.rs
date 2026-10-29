@@ -8,6 +8,7 @@ use tracing::Instrument;
 use crate::error::{Error, ErrorKind};
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
+use crate::operation::S3Request;
 use crate::transfer::StateMachineTerminalReceiver;
 use crate::types::AbortedUpload;
 use crate::types::FailedMultipartUploadPolicy;
@@ -163,20 +164,19 @@ impl UploadHandle {
             match abort_policy {
                 FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
                 FailedMultipartUploadPolicy::AbortUpload => {
-                    let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
+                    let req = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
                         self.transfer.request(),
                         ctx.s3_client()
                             .abort_multipart_upload()
                             .upload_id(&upload_id),
-                    )
-                    .customize()
-                    .config_override(
-                        ctx.handle
-                            .bucket_partition_override(self.transfer.request().bucket()),
-                    )
-                    .send()
-                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-                    .await?;
+                    );
+                    let resp = self
+                        .transfer
+                        .op()
+                        .customize(S3Request::AbortMultipartUpload, req.customize())
+                        .send()
+                        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                        .await?;
 
                     Ok(AbortedUpload {
                         upload_id: Some(upload_id),
@@ -230,7 +230,7 @@ mod tests {
     use crate::io::InputStream;
     use crate::operation::upload::transfer::UploadTransfer;
     use crate::operation::upload::UploadInput;
-    use crate::transfer::TransferContext;
+    use crate::operation::{OperationContext, OperationKind};
     use crate::types::BucketType;
 
     fn is_send<T: Send>() {}
@@ -265,13 +265,13 @@ mod tests {
             .build()
             .unwrap();
         let stream = input.take_body();
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer =
-            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::Upload { from_file: false }, None);
+        let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 
         // Drive to Cancelled terminal state.
-        ctx.set_cancelled();
-        ctx.signal_terminal();
+        transfer.ctx().set_cancelled();
+        transfer.ctx().signal_terminal();
 
         let upload_handle = UploadHandle::new(completion_rx, transfer);
         let err = upload_handle

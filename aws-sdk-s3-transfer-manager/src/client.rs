@@ -98,57 +98,20 @@ impl Handle {
         matches!(self.config.part_size(), PartSize::Target(_))
     }
 
-    /// Per-operation config override that keys the retry token bucket by bucket.
+    /// The retry partition shared by an operation's non-listing requests to `bucket`.
     ///
-    /// Returns an empty override when no bucket is set, which merges as a no-op.
     /// The partition is cached so all operations to the same bucket share one
     /// live token bucket (and its refill): under a total outage the sustained
     /// retry rate to S3 is `REFILL_RATE / throttling_retry_cost` (approx 2
     /// retries/sec per bucket), independent of concurrency.
-    pub(crate) fn bucket_partition_override(
+    pub(crate) fn retry_partition(
         &self,
-        bucket: Option<&str>,
-    ) -> aws_sdk_s3::config::Builder {
-        let builder = aws_sdk_s3::config::Builder::default();
-        match bucket {
-            Some(b) => {
-                let partition = {
-                    let mut map = self.retry_partitions.lock().expect("lock poisoned");
-                    map.entry(b.to_owned())
-                        .or_insert_with(|| crate::retry::bucket_retry_partition(b))
-                        .clone()
-                };
-                builder.retry_partition(partition)
-            }
-            None => builder,
-        }
-    }
-
-    /// Per-operation config override for a transfer body (download GET or upload):
-    /// bucket retry partition plus the tightened stalled-stream grace.
-    fn transfer_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-        self.bucket_partition_override(bucket)
-            .stalled_stream_protection(crate::retry::tightened_ssp())
-    }
-
-    /// Per-operation config override for a download GET: bucket retry partition
-    /// plus the tightened stalled-stream grace on the response body. Intentionally
-    /// identical to [`upload_override`](Self::upload_override) (both delegate to
-    /// `transfer_override`); the two names document the call site's direction.
-    pub(crate) fn download_get_override(
-        &self,
-        bucket: Option<&str>,
-    ) -> aws_sdk_s3::config::Builder {
-        self.transfer_override(bucket)
-    }
-
-    /// Per-operation config override for an upload (UploadPart / PutObject):
-    /// bucket retry partition plus the tightened stalled-stream grace on the
-    /// request body. Intentionally identical to
-    /// [`download_get_override`](Self::download_get_override); the two names
-    /// document the call site's direction.
-    pub(crate) fn upload_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-        self.transfer_override(bucket)
+        bucket: &str,
+    ) -> aws_sdk_s3::config::retry::RetryPartition {
+        let mut map = self.retry_partitions.lock().expect("lock poisoned");
+        map.entry(bucket.to_owned())
+            .or_insert_with(|| crate::retry::bucket_retry_partition(bucket))
+            .clone()
     }
 
     /// Create a Handle for testing on the ambient tokio runtime with a fixed
@@ -264,6 +227,8 @@ impl Client {
             .cloned()
             .unwrap_or_else(crate::runtime::platform::MachineProfile::detect_local);
 
+        let client_features = crate::config::user_agent::client_features(&config, &profile);
+
         // 1. Create concurrency controller and telemetry
         let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = {
             // Resolve the concurrency target once, at construction. The preview
@@ -329,6 +294,7 @@ impl Client {
                     crate::config::user_agent::install_on_client(
                         client,
                         config.framework_metadata().cloned(),
+                        client_features,
                     )
                 }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
@@ -341,6 +307,7 @@ impl Client {
                     crate::config::user_agent::install(
                         &mut builder,
                         config.framework_metadata().cloned(),
+                        client_features,
                     );
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }
@@ -892,7 +859,7 @@ mod tests {
 
         // Same bucket, three calls: one cache entry, populated once.
         for _ in 0..3 {
-            let _ = handle.bucket_partition_override(Some("bucket-a"));
+            let _ = handle.retry_partition("bucket-a");
         }
         assert_eq!(
             handle.retry_partitions.lock().unwrap().len(),
@@ -900,9 +867,8 @@ mod tests {
             "repeated calls for one bucket must reuse a single cached partition"
         );
 
-        // A second bucket adds its own entry; `None` adds nothing.
-        let _ = handle.bucket_partition_override(Some("bucket-b"));
-        let _ = handle.bucket_partition_override(None);
+        // A second bucket adds its own entry.
+        let _ = handle.retry_partition("bucket-b");
         let map = handle.retry_partitions.lock().unwrap();
         assert_eq!(map.len(), 2, "each distinct bucket caches one partition");
         assert!(map.contains_key("bucket-a") && map.contains_key("bucket-b"));

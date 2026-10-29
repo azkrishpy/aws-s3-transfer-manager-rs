@@ -17,6 +17,7 @@ use crate::error;
 use crate::io::walk::{DirEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
+use crate::operation::OperationContext;
 use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
 use crate::transfer::{
@@ -134,7 +135,7 @@ impl Drop for Reservation {
             state.children_reserved = state.children_reserved.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.transfer.ctx.id,
+                tid = %self.transfer.op.transfer().id,
                 count = self.count,
                 "Reservation dropped unconsumed; children_reserved recovered"
             );
@@ -218,7 +219,7 @@ impl Drop for ReapingBatch {
             state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.transfer.ctx.id,
+                tid = %self.transfer.op.transfer().id,
                 count = self.count,
                 "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
             );
@@ -307,7 +308,7 @@ impl Drop for WalkSlot {
             }
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.transfer.ctx.id,
+                tid = %self.transfer.op.transfer().id,
                 walk_id = self.walk_id,
                 "WalkSlot dropped unconsumed; in_flight_walks recovered"
             );
@@ -415,21 +416,21 @@ pub(crate) struct UploadObjectsTransfer {
 }
 
 struct UploadObjectsTransferInner {
-    ctx: TransferContext,
+    op: OperationContext,
     request: Arc<super::UploadObjectsInput>,
     state: Mutex<State>,
 }
 
 impl UploadObjectsTransfer {
     pub(crate) fn new(
-        ctx: TransferContext,
+        op: OperationContext,
         request: super::UploadObjectsInput,
         walker: FsWalk,
     ) -> Self {
         let mut walks = BTreeMap::new();
         walks.insert(0, walker);
         let inner = Arc::new(UploadObjectsTransferInner {
-            ctx,
+            op,
             request: Arc::new(request),
             state: Mutex::new(State {
                 walks,
@@ -447,7 +448,7 @@ impl UploadObjectsTransfer {
     }
 
     pub(crate) fn ctx(&self) -> &TransferContext {
-        &self.inner.ctx
+        self.inner.op.transfer()
     }
 
     pub(crate) fn successful_uploads(&self) -> u64 {
@@ -486,7 +487,7 @@ impl UploadObjectsTransfer {
     /// accumulating. Walk and spawn are skipped when inactive so cancel/fail
     /// stops new work while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
-        let active = self.inner.ctx.is_active();
+        let active = self.ctx().is_active();
         let mut state = self.inner.state.lock();
 
         // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
@@ -527,11 +528,7 @@ impl UploadObjectsTransfer {
                                     key,
                                     input,
                                 } = claimed;
-                                let outcome = Upload::orchestrate_child(
-                                    self.inner.ctx.handle.clone(),
-                                    input,
-                                    self.inner.ctx.id.id,
-                                );
+                                let outcome = Upload::orchestrate_child(&self.inner.op, input);
                                 (outcome, source_path, key)
                             })
                             .collect();
@@ -587,8 +584,7 @@ impl UploadObjectsTransfer {
         if active {
             state.debug_assert_capacity(self.max_concurrent_uploads());
         }
-        self.inner
-            .ctx
+        self.ctx()
             .set_pending(PendingCause::in_flight_work("bulk_work_completion"));
         PollWork::Pending
     }
@@ -599,7 +595,7 @@ impl UploadObjectsTransfer {
         let cause = cause.into();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             "upload_objects aborting: {cause}"
         );
         // TODO: the triggering child's error is preserved structurally in
@@ -608,12 +604,10 @@ impl UploadObjectsTransfer {
         // to the failing child's error needs a shareable error (`Arc`) since
         // `Error` is not `Clone` and the child is also owned by the
         // failed-uploads list.
-        self.inner
-            .ctx
-            .set_failed_and_signal(crate::error::Error::new(
-                crate::error::ErrorKind::ChildOperationFailed,
-                format!("upload_objects aborted: {cause}"),
-            ));
+        self.ctx().set_failed_and_signal(crate::error::Error::new(
+            crate::error::ErrorKind::ChildOperationFailed,
+            format!("upload_objects aborted: {cause}"),
+        ));
         PollWork::Done
     }
 
@@ -777,7 +771,7 @@ impl UploadObjectsTransfer {
                     let child_id = handle.id();
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         child_id = ?child_id,
                         key = %key,
                         "spawned child upload"
@@ -825,7 +819,7 @@ impl UploadObjectsTransfer {
                     state.next_walk_id += 1;
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         parent_walk_id = wid,
                         new_walk_id = new_id,
                         "claimed subtree"
@@ -841,7 +835,7 @@ impl UploadObjectsTransfer {
     }
 
     fn check_terminal(&self, state: &mut State) -> Option<PollWork> {
-        if !self.inner.ctx.is_active() {
+        if !self.ctx().is_active() {
             // Cancelled or failed: wait only for genuinely in-flight work to
             // drain before signaling terminal, so the parent does not report
             // Done with siblings still running. Undispatched walkers (`walks`)
@@ -857,12 +851,12 @@ impl UploadObjectsTransfer {
             {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    tid = %self.inner.ctx.id,
+                    tid = %self.ctx().id,
                     successful = state.successful_uploads,
                     failed = state.failed.len(),
                     "upload_objects terminal (cancelled/failed), signaling",
                 );
-                self.inner.ctx.signal_terminal();
+                self.ctx().signal_terminal();
                 return Some(PollWork::Done);
             }
             return None;
@@ -877,18 +871,18 @@ impl UploadObjectsTransfer {
             && state.children_reserved == 0
             && state.reaping_in_flight == 0
         {
-            let m = self.inner.ctx.metrics();
+            let m = self.ctx().metrics();
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 successful = state.successful_uploads,
                 failed = state.failed.len(),
                 network_tx = m.network_tx,
                 disk_read = m.disk_read,
                 "upload_objects complete"
             );
-            self.inner.ctx.set_completed();
-            self.inner.ctx.signal_terminal();
+            self.ctx().set_completed();
+            self.ctx().signal_terminal();
             return Some(PollWork::Done);
         }
         None
@@ -906,7 +900,7 @@ impl UploadObjectsTransfer {
         if state.pending_entries.len() >= WALK_LOW_WATER {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 pending_entries = state.pending_entries.len(),
                 "dispatch_walk.none.buffer_full"
             );
@@ -915,7 +909,7 @@ impl UploadObjectsTransfer {
         if state.walks.is_empty() && state.in_flight_walks > 0 {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 in_flight_walks = state.in_flight_walks,
                 "dispatch_walk.none.walks_in_flight"
             );
@@ -924,7 +918,7 @@ impl UploadObjectsTransfer {
         if state.in_flight_walks >= MAX_PARALLEL_WALKS {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 in_flight_walks = state.in_flight_walks,
                 MAX_PARALLEL_WALKS,
                 "dispatch_walk.none.walks_saturated"
@@ -946,7 +940,7 @@ impl UploadObjectsTransfer {
             };
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 walk_id,
                 "dispatching advance_walker"
             );
@@ -958,7 +952,7 @@ impl UploadObjectsTransfer {
         } else {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
                 in_flight_walks = state.in_flight_walks,
@@ -985,10 +979,10 @@ impl UploadObjectsTransfer {
     async fn execute_advance_walker(&self, mut slot: WalkSlot) -> WorkOutcome {
         let walk_id = slot.walk_id;
         let mut walk = slot.take_walk();
-        let ctx = &self.inner.ctx;
+        let ctx = self.ctx();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             walk_id,
             ready_files = walk.ready_files_len(),
             pending_dirs = walk.pending_dirs_len(),
@@ -1031,7 +1025,7 @@ impl UploadObjectsTransfer {
         if let Some(fatal) = fatal_error {
             tracing::error!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 walk_id,
                 error = %fatal,
                 "fatal walker error, failing upload_objects"
@@ -1050,7 +1044,7 @@ impl UploadObjectsTransfer {
         for we in walk_errors {
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                tid = %self.inner.ctx.id,
+                tid = %self.ctx().id,
                 walk_id,
                 path = ?we.path(),
                 error = %we,
@@ -1081,7 +1075,7 @@ impl UploadObjectsTransfer {
         slot.consume(&mut state, walk_back);
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             walk_id,
             yielded = n_entries,
             ready_files = ready_files_remaining,
@@ -1116,7 +1110,7 @@ impl UploadObjectsTransfer {
         let n_children = children.len();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             n_children,
             "join_children start"
         );
@@ -1151,7 +1145,7 @@ impl UploadObjectsTransfer {
                     // per-transfer metrics without double-counting them in
                     // the client-level telemetry counters, which the child's
                     // own context already updated during its transfer.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
+                    self.ctx().metrics.record_io(&crate::metrics::IoSample {
                         network_tx: metrics.network_tx,
                         network_rx: metrics.network_rx,
                         disk_read: metrics.disk_read,
@@ -1159,7 +1153,7 @@ impl UploadObjectsTransfer {
                     });
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         key = %key,
                         "child upload completed"
                     );
@@ -1169,7 +1163,7 @@ impl UploadObjectsTransfer {
                     // may have aborted the transfer, at which point later
                     // children should be recorded but must not re-trigger
                     // the abort cascade.
-                    let active = self.inner.ctx.is_active();
+                    let active = self.ctx().is_active();
                     let should_abort = !aborted_in_batch
                         && active
                         && *self.failure_policy() == FailedTransferPolicy::Abort;
@@ -1177,7 +1171,7 @@ impl UploadObjectsTransfer {
                         should_abort.then(|| format!("child upload failed ({key}): {e}"));
                     tracing::warn!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        tid = %self.inner.ctx.id,
+                        tid = %self.ctx().id,
                         key = %key,
                         error = %e,
                         "child upload failed"
@@ -1207,7 +1201,7 @@ impl UploadObjectsTransfer {
         state.debug_assert_capacity(self.max_concurrent_uploads());
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            tid = %self.inner.ctx.id,
+            tid = %self.ctx().id,
             reaped,
             "join_children end"
         );
@@ -1220,7 +1214,7 @@ impl UploadObjectsTransfer {
             return WorkOutcome::Success { data: None };
         }
         drop(state);
-        self.inner.ctx.try_wake();
+        self.ctx().try_wake();
         WorkOutcome::Success { data: None }
     }
 }
@@ -1228,7 +1222,7 @@ impl UploadObjectsTransfer {
 impl fmt::Debug for UploadObjectsTransfer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UploadObjectsTransfer")
-            .field("id", &self.inner.ctx.id)
+            .field("id", &self.ctx().id)
             .finish_non_exhaustive()
     }
 }
@@ -1295,7 +1289,7 @@ pub(crate) fn derive_object_key<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer::TransferContext;
+    use crate::operation::{OperationContext, OperationKind};
     use crate::types::FailedTransferPolicy;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -1417,18 +1411,18 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(source).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::UploadObjects, None);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
         // Register the parent group so children spawned via the scheduler
         // can find it. The composite is driven directly via `drive_transfer`
         // rather than enqueued, so we set up only the group entry, not the
         // descriptor in `transfers`.
         transfer
-            .inner
-            .ctx
+            .ctx()
             .handle
             .scheduler
-            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+            .register_empty_group_for_test(transfer.ctx().id.id);
         (transfer, completion_rx)
     }
 
@@ -1542,14 +1536,14 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::UploadObjects, None);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
         transfer
-            .inner
-            .ctx
+            .ctx()
             .handle
             .scheduler
-            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+            .register_empty_group_for_test(transfer.ctx().id.id);
 
         timeout(Duration::from_secs(5), async {
             drive_transfer(&transfer).await;
@@ -2221,14 +2215,14 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::UploadObjects, None);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
         transfer
-            .inner
-            .ctx
+            .ctx()
             .handle
             .scheduler
-            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+            .register_empty_group_for_test(transfer.ctx().id.id);
 
         let mut max_observed: usize = 0;
 
@@ -2302,14 +2296,14 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::UploadObjects, None);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
         transfer
-            .inner
-            .ctx
+            .ctx()
             .handle
             .scheduler
-            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+            .register_empty_group_for_test(transfer.ctx().id.id);
 
         // A regression (the bug) causes this to hang forever.
         timeout(Duration::from_secs(5), async {
@@ -2354,14 +2348,14 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let (ctx, completion_rx) = TransferContext::new(handle);
+        let (ctx, completion_rx) =
+            OperationContext::new(handle, OperationKind::UploadObjects, None);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
         transfer
-            .inner
-            .ctx
+            .ctx()
             .handle
             .scheduler
-            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+            .register_empty_group_for_test(transfer.ctx().id.id);
 
         timeout(Duration::from_secs(5), async {
             drive_transfer(&transfer).await;
