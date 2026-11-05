@@ -600,6 +600,26 @@ mod tests {
         );
     }
 
+    /// Dropping the handle before `join` or `abort` removes the temporary file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_managed_download_drop_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("out.dat.s3tmp.0000abcd");
+        std::fs::write(&temp, b"partial").unwrap();
+
+        let (inner, _consumer) = make_cancelled_download_inner();
+        let dest = dir.path().join("out.dat");
+        drop(ManagedDownloadHandle::new(
+            inner,
+            Dir::cwd(),
+            temp.clone(),
+            dest,
+        ));
+
+        assert!(!temp.exists(), "drop must remove the temp file");
+    }
+
     /// Once `finalize` has renamed the temporary file, dropping the handle
     /// must not remove a file another download has since created under the
     /// same temporary name. `join` consumes the handle right after
