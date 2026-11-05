@@ -313,6 +313,49 @@ async fn test_failed_download_policy_continue() {
     assert_eq!(Some("key3"), failed_transfer.input().key());
 }
 
+/// A key under a directory symlink that leads outside the destination fails, and leaves the
+/// outside directory as it was.
+#[tokio::test]
+async fn test_directory_symlink_out_of_destination_fails() {
+    let bucket = MockBucket::builder().key_with_size("dir/a", 5).build();
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let root = tempfile::tempdir().unwrap();
+    let dest = root.path().join("destination");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a"), "existing local data").unwrap();
+    std::os::unix::fs::symlink("../outside", dest.join("dir")).unwrap();
+
+    let output = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(&dest)
+        .failure_policy(FailedTransferPolicy::Continue)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+
+    assert_eq!(0, output.objects_downloaded());
+    let failures = output.failed_transfers();
+    assert_eq!(1, failures.len());
+    assert_eq!(Some("dir/a"), failures[0].input().key());
+    assert_eq!(vec!["a"], relative_path_names(&outside).unwrap());
+    assert_eq!(
+        "existing local data",
+        std::fs::read_to_string(outside.join("a")).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_recursively_downloads() {
     let mut expected_keys = vec![

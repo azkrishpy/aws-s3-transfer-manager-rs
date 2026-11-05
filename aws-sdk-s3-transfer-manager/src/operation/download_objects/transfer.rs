@@ -12,7 +12,7 @@
 use parking_lot::Mutex;
 use path_clean::PathClean;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -263,9 +263,6 @@ struct DownloadObjectsTransferInner {
     delimiter: Option<String>,
     failure_policy: FailedTransferPolicy,
     pipeline_depth: usize,
-    /// Directories already created (dedup `create_dir_all` across children
-    /// that share a prefix; objects in the same S3 "folder" map to one dir).
-    created_dirs: Mutex<HashSet<PathBuf>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -301,7 +298,6 @@ impl DownloadObjectsTransfer {
                 delimiter,
                 failure_policy,
                 pipeline_depth,
-                created_dirs: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -519,28 +515,23 @@ impl DownloadObjectsTransfer {
             self.inner.delimiter.as_deref(),
         )?;
 
-        // Create parent directories, deduped via created_dirs so we don't
-        // re-stat the whole ancestor chain for every object sharing a prefix
-        // (create_dir_all stats each ancestor; for N small files in a few
-        // dirs that's the dominant per-child syscall cost).
-        //
-        // TODO(vnext): revisit moving this to the execute phase. poll_work is
-        // documented as non-blocking, but the scheduler is edge-triggered so
-        // this often already runs on a managed thread; deferring to execute adds
-        // a work-item round-trip that may increase total latency rather than
-        // reduce it. Measure before moving.
-        if let Some(parent) = dest_path.parent() {
-            let known = self.inner.created_dirs.lock().contains(parent);
-            if !known {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    error::Error::new(
-                        ErrorKind::IOError,
-                        format!("failed to create directory for key '{key}': {e}"),
-                    )
-                })?;
-                self.inner.created_dirs.lock().insert(parent.to_path_buf());
-            }
-        }
+        // Resolve the key's directories one at a time beneath the destination,
+        // so a directory symlink there cannot lead the download outside it.
+        let relative = dest_path.strip_prefix(&self.inner.destination).ok();
+        let Some((parent, name)) = relative.and_then(|r| Some((r.parent()?, r.file_name()?)))
+        else {
+            return Err(error::Error::new(
+                ErrorKind::InputInvalid,
+                format!("key '{key}' maps to the destination directory itself"),
+            ));
+        };
+        let dir =
+            crate::io::fs::Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
+                error::Error::new(
+                    ErrorKind::IOError,
+                    format!("failed to create directory for key '{key}': {e}"),
+                )
+            })?;
 
         let input = DownloadInput::builder()
             .bucket(&self.inner.bucket)
@@ -551,20 +542,22 @@ impl DownloadObjectsTransfer {
         // Create temp file synchronously (we're in poll_work, not async).
         // orchestrate_to_path is async; for child spawning we use the
         // synchronous helper + orchestrate_with_sink directly.
-        let (file, temp_path) =
-            crate::io::fs::create_first_new(crate::operation::download::temp_file_candidates(
-                &dest_path,
+        let (file, temp_name) = crate::io::fs::create_first_new(
+            &dir,
+            crate::operation::download::temp_file_candidates(
+                Path::new(name),
                 std::iter::repeat_with(|| fastrand::u32(..)),
-            ))
-            .map_err(|e| {
-                error::Error::new(
-                    ErrorKind::IOError,
-                    format!("failed to create temp file for key '{key}': {e}"),
-                )
-            })?;
+            ),
+        )
+        .map_err(|e| {
+            error::Error::new(
+                ErrorKind::IOError,
+                format!("failed to create temp file for key '{key}': {e}"),
+            )
+        })?;
         let sink = FileSinkFactory.create(file, true).map_err(|e| {
             // No handle owns the temp file yet, so remove it here.
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = dir.remove_file(&temp_name);
             error::Error::new(
                 ErrorKind::IOError,
                 format!("failed to create destination sink for key '{key}': {e}"),
@@ -572,7 +565,12 @@ impl DownloadObjectsTransfer {
         })?;
 
         let inner = Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id))?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        Ok(ManagedDownloadHandle::new(
+            inner,
+            dir,
+            temp_name,
+            name.into(),
+        ))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into

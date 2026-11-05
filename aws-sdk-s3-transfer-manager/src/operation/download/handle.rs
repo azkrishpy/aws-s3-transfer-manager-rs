@@ -4,11 +4,13 @@
  */
 
 use crate::error::{self, ErrorKind};
+use crate::io::fs::Dir;
 use crate::operation::download::body::{Body, RecvBodyConsumer};
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
 use crate::operation::download::ObjectMetadata;
 use crate::transfer::{StateMachineTerminalReceiver, TransferId};
+use std::path::PathBuf;
 
 /// Shared core logic for download handles.
 ///
@@ -350,35 +352,35 @@ impl Drop for DownloadHandle {
 #[derive(Debug)]
 pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
-    /// The temporary file this handle still owns, for a download to a path.
+    /// For a download to a path: the directory it downloads into, the
+    /// temporary file there that this handle still owns, and the destination
+    /// name. Both names resolve in the directory.
     ///
-    /// Whatever renames or removes the file takes the path first:
+    /// Whatever renames or removes the file takes these first:
     /// [`finalize`](Self::finalize) and [`cleanup`](Self::cleanup) for `join`
     /// and `abort`, otherwise drop. Each name is therefore renamed or removed
     /// once, even if the caller stops awaiting `join` partway. After that the
     /// name is free, and another download may have created its own file there.
-    temp_path: Option<std::path::PathBuf>,
-    dest_path: Option<std::path::PathBuf>,
+    target: Option<(Dir, PathBuf, PathBuf)>,
 }
 
 impl ManagedDownloadHandle {
     pub(crate) fn new(
         inner: DownloadHandleInner,
-        temp_path: std::path::PathBuf,
-        dest_path: std::path::PathBuf,
+        dir: Dir,
+        temp_path: PathBuf,
+        dest_path: PathBuf,
     ) -> Self {
         Self {
             inner,
-            temp_path: Some(temp_path),
-            dest_path: Some(dest_path),
+            target: Some((dir, temp_path, dest_path)),
         }
     }
 
     pub(crate) fn new_unmanaged(inner: DownloadHandleInner) -> Self {
         Self {
             inner,
-            temp_path: None,
-            dest_path: None,
+            target: None,
         }
     }
 
@@ -456,15 +458,17 @@ impl ManagedDownloadHandle {
     /// Takes the temporary path before renaming, so neither
     /// [`cleanup`](Self::cleanup) nor drop acts on that name afterwards.
     async fn finalize(&mut self) -> std::io::Result<()> {
-        if let (Some(temp), Some(dest)) = (self.temp_path.take(), &self.dest_path) {
+        if let Some((dir, temp, dest)) = self.target.take() {
             // TODO(vnext): consider an opt-in download durability policy. Managed
             // path downloads would sync file data before rename and the parent
             // directory after rename where supported. The latency and cross-platform
             // semantics make this a client/API policy rather than the default.
-            if let Err(e) = crate::io::fs::rename_async(&temp, dest).await {
-                let _ = crate::io::fs::remove_file_async(&temp).await;
-                return Err(e);
-            }
+            crate::io::fs::run_blocking(move || {
+                dir.rename(&temp, &dest).inspect_err(|_| {
+                    let _ = dir.remove_file(&temp);
+                })
+            })
+            .await?;
         }
         Ok(())
     }
@@ -474,8 +478,8 @@ impl ManagedDownloadHandle {
     /// Takes the temporary path before removing it, so drop doesn't remove
     /// that name again.
     async fn cleanup(&mut self) {
-        if let Some(temp) = self.temp_path.take() {
-            let _ = crate::io::fs::remove_file_async(&temp).await;
+        if let Some((dir, temp, _)) = self.target.take() {
+            let _ = crate::io::fs::run_blocking(move || dir.remove_file(&temp)).await;
         }
     }
 }
@@ -490,15 +494,15 @@ impl Drop for ManagedDownloadHandle {
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
         }
-        if let Some(temp) = &self.temp_path {
-            let _ = std::fs::remove_file(temp);
+        if let Some((dir, temp, _)) = &self.target {
+            let _ = dir.remove_file(temp);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
+    use super::{Dir, DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
     use crate::error::ErrorKind;
     use crate::operation::download::body::{new_recv_body, RecvBodyConsumer};
     use crate::operation::download::transfer::DownloadTransfer;
@@ -579,7 +583,7 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
 
         let err = managed
             .join()
@@ -609,7 +613,7 @@ mod tests {
         std::fs::write(&temp, b"object").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
         managed.finalize().await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"object");
 
@@ -633,7 +637,7 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
         managed.cleanup().await;
         assert!(!temp.exists(), "cleanup must remove the temp file");
 
@@ -657,7 +661,7 @@ mod tests {
         std::fs::write(&temp, b"object").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
         let err = managed
             .finalize()
             .await
