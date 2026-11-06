@@ -543,7 +543,10 @@ impl DownloadObjectsTransfer {
                 let dir = Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
                     error::Error::new(
                         ErrorKind::IOError,
-                        format!("failed to create directory for key '{key}': {e}"),
+                        format!(
+                            "failed to create or open directory for key '{key}' \
+                             without following symbolic links: {e}"
+                        ),
                     )
                 })?;
                 let dir = Arc::new(dir);
