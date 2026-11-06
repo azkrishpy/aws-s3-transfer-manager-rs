@@ -31,11 +31,10 @@ use std::{
 ///
 /// On Unix and WASI, the destination may itself be a symbolic link, but a
 /// symbolic link inside it is not followed: a key whose path passes through
-/// one is reported as a failure the same way. A directory is opened when a key
-/// first needs it and reused while any download into it is in flight; until
-/// then that handle keeps receiving files even if the directory is moved, even
-/// out of the destination. The destination path itself is resolved again
-/// whenever a key needs a directory that is not open. The destination and every
+/// one is reported as a failure the same way, including when a directory is
+/// replaced by a link while its key downloads. A link at a key's own path is
+/// replaced by the downloaded file, not followed. The destination path itself
+/// is resolved again by each file operation. The destination and every
 /// existing directory under it must be readable as well as searchable. On other
 /// platforms, including Windows, symbolic links and junctions inside the
 /// destination are followed, so a key's file can be written outside the

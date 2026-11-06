@@ -159,7 +159,7 @@ impl Download {
         let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
         Ok(ManagedDownloadHandle::new(
             inner,
-            Arc::new(crate::io::fs::Dir::cwd()),
+            crate::io::fs::Dir::cwd(),
             temp_path,
             dest_path,
         ))

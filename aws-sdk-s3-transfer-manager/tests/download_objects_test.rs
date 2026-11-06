@@ -357,18 +357,18 @@ async fn download_into_symlinked_destination(
 }
 
 /// Under `Continue`, a key under a directory symlink inside the destination and a key that maps
-/// to the destination itself fail, other keys download through a symlinked destination, and
-/// nothing is written anywhere else.
+/// to the destination itself fail, other keys download through a symlinked destination, a key
+/// named like the symlink replaces it, and nothing is written anywhere else.
 #[tokio::test]
 async fn test_directory_symlink_in_destination_fails_continue() {
     let (root, result) = download_into_symlinked_destination(
-        &["dir/a", "b", "x/.."],
+        &["dir/a", "b", "dir", "x/.."],
         FailedTransferPolicy::Continue,
     )
     .await;
     let output = result.unwrap();
 
-    assert_eq!(1, output.objects_downloaded());
+    assert_eq!(2, output.objects_downloaded());
     let mut failures: Vec<_> = output
         .failed_transfers()
         .iter()
@@ -386,6 +386,9 @@ async fn test_directory_symlink_in_destination_fails_continue() {
         vec!["destination", "outside/a", "real/b", "real/dir"],
         relative_path_names(root.path()).unwrap()
     );
+    assert!(std::fs::symlink_metadata(root.path().join("real/dir"))
+        .unwrap()
+        .is_file());
     assert_eq!(
         "existing local data",
         std::fs::read_to_string(root.path().join("outside/a")).unwrap()

@@ -291,9 +291,9 @@ pub(crate) use dir::Dir;
 
 /// A directory in which files are created, renamed and removed by name.
 ///
-/// On Unix and WASI it holds the directory open, so names resolve in the
-/// directory that was opened even if its path is later renamed or replaced by
-/// a symbolic link.
+/// On Unix and WASI each operation opens the directory again from its root,
+/// one component at a time without following symbolic links, so no operation
+/// reaches outside the root even if a component is replaced in between.
 #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
 mod dir {
     use rustix::fs::{AtFlags, Mode, OFlags, CWD};
@@ -301,11 +301,11 @@ mod dir {
     use std::fs::File;
     use std::io;
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    /// `None` is the current directory.
+    /// The root and the path beneath it; `None` is the current directory.
     #[derive(Debug)]
-    pub(crate) struct Dir(Option<OwnedFd>);
+    pub(crate) struct Dir(Option<(PathBuf, PathBuf)>);
 
     impl Dir {
         /// The current directory, in which names resolve as plain paths.
@@ -313,45 +313,59 @@ mod dir {
             Self(None)
         }
 
-        /// Opens `root`, then each component of `relative` beneath it,
-        /// creating missing directories.
+        /// Creates the missing directories of `relative` beneath `root`.
         ///
         /// `root` may be a symbolic link. A component of `relative` that is a
         /// symbolic link fails with the platform's error for refusing to follow
         /// it.
         pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
+            let dir = Self(Some((root.into(), relative.into())));
+            dir.open(true)?;
+            Ok(dir)
+        }
+
+        /// Opens the directory, creating missing components if `create`.
+        fn open(&self, create: bool) -> io::Result<Option<OwnedFd>> {
+            let Some((root, relative)) = &self.0 else {
+                return Ok(None);
+            };
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
             let mut dir = rustix::fs::open(root, flags, Mode::empty())?;
             for name in relative.components() {
                 let name = name.as_os_str();
                 // As `create_dir_all` does, a failed `mkdirat` matters only if
                 // the directory is then missing.
-                let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
+                let made = match create {
+                    true => rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)),
+                    false => Ok(()),
+                };
                 dir = match rustix::fs::openat(&dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
                 {
                     Err(Errno::NOENT) => return Err(made.err().unwrap_or(Errno::NOENT).into()),
                     result => result?,
                 };
             }
-            Ok(Self(Some(dir)))
+            Ok(Some(dir))
         }
 
-        fn fd(&self) -> BorrowedFd<'_> {
-            self.0.as_ref().map_or(CWD, AsFd::as_fd)
+        fn at<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>) -> io::Result<T> {
+            let dir = self.open(false)?;
+            Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
         }
 
         pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
             let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
-            let fd = rustix::fs::openat(self.fd(), name, flags, Mode::from_raw_mode(0o666))?;
-            Ok(File::from(fd))
+            let mode = Mode::from_raw_mode(0o666);
+            self.at(|dir| rustix::fs::openat(dir, name, flags, mode))
+                .map(File::from)
         }
 
         pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            Ok(rustix::fs::renameat(self.fd(), from, self.fd(), to)?)
+            self.at(|dir| rustix::fs::renameat(dir, from, dir, to))
         }
 
         pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
-            Ok(rustix::fs::unlinkat(self.fd(), name, AtFlags::empty())?)
+            self.at(|dir| rustix::fs::unlinkat(dir, name, AtFlags::empty()))
         }
     }
 }
@@ -1195,12 +1209,12 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
-    /// A directory replaced by a symbolic link after `create_beneath` still
-    /// receives the rename, and the link's target is untouched.
+    /// Once a directory's path is replaced by a symbolic link, neither
+    /// publishing nor creating a file there reaches the link's target.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn dir_publishes_into_opened_directory_after_its_path_is_replaced() {
+    fn dir_refuses_a_directory_replaced_by_a_symlink() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir(outside.path().join("b")).unwrap();
@@ -1209,7 +1223,8 @@ mod tests {
 
         std::fs::rename(root.path().join("a"), root.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("a")).unwrap();
-        dir.rename(&temp, Path::new("f")).unwrap();
+        dir.rename(&temp, Path::new("f")).unwrap_err();
+        create_first_new(&dir, [PathBuf::from("g.tmp")]).unwrap_err();
 
         let names = |dir: &Path| -> Vec<_> {
             std::fs::read_dir(dir)
@@ -1217,7 +1232,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name())
                 .collect()
         };
-        assert_eq!(names(&root.path().join("moved/b")), ["f"]);
+        assert_eq!(names(&root.path().join("moved/b")), ["f.tmp"]);
         assert!(names(&outside.path().join("b")).is_empty());
     }
 }
