@@ -530,7 +530,7 @@ impl DownloadObjectsTransfer {
         else {
             return Err(error::Error::new(
                 ErrorKind::InputInvalid,
-                format!("key '{key}' maps to the destination directory itself"),
+                format!("key '{key}' has no file name below the destination"),
             ));
         };
         let dir = Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
