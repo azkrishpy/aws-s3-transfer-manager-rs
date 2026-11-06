@@ -367,7 +367,21 @@ mod dir {
             Ok(Some(dir))
         }
 
-        fn at<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>) -> io::Result<T> {
+        /// Runs `op` in the directory, after checking that each of `names` is a
+        /// single plain component when the directory has a root.
+        fn at<T>(
+            &self,
+            names: &[&Path],
+            op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>,
+        ) -> io::Result<T> {
+            let plain = |name: &&Path| {
+                let mut components = name.components();
+                matches!(components.next(), Some(Component::Normal(_)))
+                    && components.next().is_none()
+            };
+            if self.0.is_some() && !names.iter().all(plain) {
+                return Err(Errno::INVAL.into());
+            }
             let dir = self.open(false)?;
             Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
         }
@@ -375,16 +389,18 @@ mod dir {
         pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
             let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
             let mode = Mode::from_raw_mode(0o666);
-            self.at(|dir| rustix::fs::openat(dir, name, flags, mode))
+            self.at(&[name], |dir| rustix::fs::openat(dir, name, flags, mode))
                 .map(File::from)
         }
 
         pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            self.at(|dir| rustix::fs::renameat(dir, from, dir, to))
+            self.at(&[from, to], |dir| rustix::fs::renameat(dir, from, dir, to))
         }
 
         pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
-            self.at(|dir| rustix::fs::unlinkat(dir, name, AtFlags::empty()))
+            self.at(&[name], |dir| {
+                rustix::fs::unlinkat(dir, name, AtFlags::empty())
+            })
         }
     }
 }
@@ -1211,18 +1227,21 @@ mod tests {
         }
     }
 
-    /// `create_beneath` refuses a component that is not a plain name, so `..`
-    /// cannot climb out of the root.
+    /// A rooted `Dir` refuses a path component or a name that is not a single
+    /// plain component, so neither can climb out of the root.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn dir_create_beneath_refuses_parent_components() {
+    fn dir_refuses_components_that_are_not_plain_names() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("in")).unwrap();
 
         let error = Dir::create_beneath(&root.path().join("in"), Path::new("../out")).unwrap_err();
+        let dir = Dir::create_beneath(root.path(), Path::new("in")).unwrap();
+        let name_error = create_first_new(&dir, [PathBuf::from("../out")]).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(name_error.kind(), io::ErrorKind::InvalidInput);
         assert!(!root.path().join("out").exists());
     }
 
