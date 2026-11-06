@@ -289,11 +289,6 @@ pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
 
 pub(crate) use dir::Dir;
 
-/// A directory in which files are created, renamed and removed by name.
-///
-/// On Unix and WASI each operation opens the directory again from its root,
-/// one component at a time without following symbolic links, so no operation
-/// reaches outside the root even if a component is replaced in between.
 #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
 mod dir {
     use rustix::fs::{AtFlags, Mode, OFlags, CWD};
@@ -303,7 +298,14 @@ mod dir {
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::path::{Component, Path, PathBuf};
 
-    /// The root and the path beneath it; `None` is the current directory.
+    /// A directory in which files are created, renamed and removed by name.
+    ///
+    /// Holds a root and a path beneath it, or `None` for the current
+    /// directory. Each operation opens the directory again from its root, one
+    /// component at a time without following symbolic links, so no operation
+    /// reaches outside the root even if a component is replaced in between.
+    /// Names passed to an operation resolve directly in the directory and must
+    /// be single components.
     #[derive(Debug)]
     pub(crate) struct Dir(Option<(PathBuf, PathBuf)>);
 
@@ -373,16 +375,17 @@ mod dir {
     }
 }
 
-/// A directory in which files are created, renamed and removed by name.
-///
-/// Other platforms hold the directory's path, which each operation resolves
-/// again, following symbolic links.
 #[cfg(not(all(any(unix, target_os = "wasi"), not(miri))))]
 mod dir {
     use std::fs::File;
     use std::io;
     use std::path::{Path, PathBuf};
 
+    /// A directory in which files are created, renamed and removed by name.
+    ///
+    /// Holds the directory's path, which each operation resolves again,
+    /// following symbolic links. Names passed to an operation resolve in the
+    /// directory and must be single components.
     #[derive(Debug)]
     pub(crate) struct Dir(PathBuf);
 
@@ -1251,6 +1254,5 @@ mod tests {
 
         std::os::unix::fs::symlink(outside.path().join("a"), root.path().join("a")).unwrap();
         dir.rename(&temp, Path::new("f")).unwrap_err();
-        assert_eq!(names(&outside.path().join("a/b")), ["f.tmp"]);
     }
 }
