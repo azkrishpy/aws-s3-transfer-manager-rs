@@ -11,6 +11,7 @@ use crate::operation::download::transfer::DownloadTransfer;
 use crate::operation::download::ObjectMetadata;
 use crate::transfer::{StateMachineTerminalReceiver, TransferId};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Shared core logic for download handles.
 ///
@@ -361,13 +362,13 @@ pub struct ManagedDownloadHandle {
     /// and `abort`, otherwise drop. Each name is therefore renamed or removed
     /// once, even if the caller stops awaiting `join` partway. After that the
     /// name is free, and another download may have created its own file there.
-    target: Option<(Dir, PathBuf, PathBuf)>,
+    target: Option<(Arc<Dir>, PathBuf, PathBuf)>,
 }
 
 impl ManagedDownloadHandle {
     pub(crate) fn new(
         inner: DownloadHandleInner,
-        dir: Dir,
+        dir: Arc<Dir>,
         temp_path: PathBuf,
         dest_path: PathBuf,
     ) -> Self {
@@ -502,7 +503,7 @@ impl Drop for ManagedDownloadHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dir, DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
+    use super::{Arc, Dir, DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
     use crate::error::ErrorKind;
     use crate::operation::download::body::{new_recv_body, RecvBodyConsumer};
     use crate::operation::download::transfer::DownloadTransfer;
@@ -583,7 +584,8 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
+        let managed =
+            ManagedDownloadHandle::new(inner, Arc::new(Dir::cwd()), temp.clone(), dest.clone());
 
         let err = managed
             .join()
@@ -612,7 +614,7 @@ mod tests {
         let dest = dir.path().join("out.dat");
         drop(ManagedDownloadHandle::new(
             inner,
-            Dir::cwd(),
+            Arc::new(Dir::cwd()),
             temp.clone(),
             dest,
         ));
@@ -633,7 +635,8 @@ mod tests {
         std::fs::write(&temp, b"object").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
+        let mut managed =
+            ManagedDownloadHandle::new(inner, Arc::new(Dir::cwd()), temp.clone(), dest.clone());
         managed.finalize().await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"object");
 
@@ -657,7 +660,8 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
+        let mut managed =
+            ManagedDownloadHandle::new(inner, Arc::new(Dir::cwd()), temp.clone(), dest.clone());
         managed.cleanup().await;
         assert!(!temp.exists(), "cleanup must remove the temp file");
 
@@ -681,7 +685,8 @@ mod tests {
         std::fs::write(&temp, b"object").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, Dir::cwd(), temp.clone(), dest.clone());
+        let mut managed =
+            ManagedDownloadHandle::new(inner, Arc::new(Dir::cwd()), temp.clone(), dest.clone());
         let err = managed
             .finalize()
             .await

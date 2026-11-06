@@ -16,9 +16,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::error::{self, Error, ErrorKind};
+use crate::io::fs::Dir;
 use crate::io::walk::S3Walk;
 use crate::model::Object;
 use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
@@ -263,6 +264,8 @@ struct DownloadObjectsTransferInner {
     delimiter: Option<String>,
     failure_policy: FailedTransferPolicy,
     pipeline_depth: usize,
+    /// Directories children have opened, by path relative to the destination.
+    dirs: Mutex<HashMap<PathBuf, Weak<Dir>>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -298,6 +301,7 @@ impl DownloadObjectsTransfer {
                 delimiter,
                 failure_policy,
                 pipeline_depth,
+                dirs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -517,6 +521,13 @@ impl DownloadObjectsTransfer {
 
         // Resolve the key's directories one at a time beneath the destination,
         // so a directory symlink there cannot lead the download outside it.
+        // Children in one directory share its descriptor while any is open.
+        //
+        // TODO(vnext): revisit moving this to the execute phase. poll_work is
+        // documented as non-blocking, but the scheduler is edge-triggered so
+        // this often already runs on a managed thread; deferring to execute adds
+        // a work-item round-trip that may increase total latency rather than
+        // reduce it. Measure before moving.
         let relative = dest_path.strip_prefix(&self.inner.destination).ok();
         let Some((parent, name)) = relative.and_then(|r| Some((r.parent()?, r.file_name()?)))
         else {
@@ -525,13 +536,22 @@ impl DownloadObjectsTransfer {
                 format!("key '{key}' maps to the destination directory itself"),
             ));
         };
-        let dir =
-            crate::io::fs::Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
-                error::Error::new(
-                    ErrorKind::IOError,
-                    format!("failed to create directory for key '{key}': {e}"),
-                )
-            })?;
+        let cached = self.inner.dirs.lock().get(parent).and_then(Weak::upgrade);
+        let dir = match cached {
+            Some(dir) => dir,
+            None => {
+                let dir = Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
+                    error::Error::new(
+                        ErrorKind::IOError,
+                        format!("failed to create directory for key '{key}': {e}"),
+                    )
+                })?;
+                let dir = Arc::new(dir);
+                let mut dirs = self.inner.dirs.lock();
+                dirs.insert(parent.to_path_buf(), Arc::downgrade(&dir));
+                dir
+            }
+        };
 
         let input = DownloadInput::builder()
             .bucket(&self.inner.bucket)

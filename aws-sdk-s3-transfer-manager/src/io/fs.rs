@@ -323,16 +323,15 @@ mod dir {
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
             let mut dir = rustix::fs::open(root, flags, Mode::empty())?;
             for name in relative.components() {
-                match rustix::fs::mkdirat(&dir, name.as_os_str(), Mode::from_raw_mode(0o777)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                dir = rustix::fs::openat(
-                    &dir,
-                    name.as_os_str(),
-                    flags | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                )?;
+                let name = name.as_os_str();
+                // As `create_dir_all` does, a failed `mkdirat` matters only if
+                // the directory is then missing.
+                let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
+                dir = match rustix::fs::openat(&dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
+                {
+                    Err(Errno::NOENT) => return Err(made.err().unwrap_or(Errno::NOENT).into()),
+                    result => result?,
+                };
             }
             Ok(Self(Some(dir)))
         }
@@ -1191,10 +1190,13 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("a")).unwrap();
         dir.rename(&temp, Path::new("f")).unwrap();
 
-        assert!(root.path().join("moved/b/f").is_file());
-        assert_eq!(
-            std::fs::read_dir(outside.path().join("b")).unwrap().count(),
-            0
-        );
+        let names = |dir: &Path| -> Vec<_> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        };
+        assert_eq!(names(&root.path().join("moved/b")), ["f"]);
+        assert!(names(&outside.path().join("b")).is_empty());
     }
 }

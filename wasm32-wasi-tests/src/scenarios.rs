@@ -85,6 +85,7 @@ pub(crate) async fn run_all(work: &Path, server: SocketAddr) -> Result<(), Strin
         "write to open file" => write_to_open_file,
         "directory round trip" => directory_round_trip,
         "symlink cycle" => symlink_cycle,
+        "directory symlink in destination" => directory_symlink_in_destination,
         "many files" => many_files,
     }
     Ok(())
@@ -480,6 +481,49 @@ async fn symlink_cycle(store: Store, work: &Path) -> Result<String, String> {
         "{} SymlinkCycle failure; {summary}",
         uploaded.failed_transfers().len()
     ))
+}
+
+/// A key under a directory symlink inside the destination fails, and the file
+/// the link leads to keeps its contents.
+async fn directory_symlink_in_destination(store: Store, work: &Path) -> Result<String, String> {
+    let before = alive_tasks();
+    let client = store.client(|config| config);
+    store
+        .insert("escape/dir/a", Bytes::from_static(b"downloaded"))
+        .await?;
+    let destination = work.join("destination");
+    let outside = work.join("outside/a");
+    write(&outside, b"existing")?;
+    create_dir(&destination)?;
+    let link = destination.join("dir");
+    #[allow(deprecated)]
+    std::fs::soft_link("../outside", &link).map_err(fs_error(link.display()))?;
+
+    let downloaded = client
+        .download_objects()
+        .bucket("bucket")
+        .walker(S3Walker::builder().prefix("escape/").build())
+        .destination(&destination)
+        .failure_policy(FailedTransferPolicy::Continue)
+        .initiate()
+        .map_err(|e| error("initiate download_objects", e))?
+        .join()
+        .await
+        .map_err(|e| error("download_objects", e))?;
+    let failures = downloaded.failed_transfers();
+    ensure!(
+        downloaded.objects_downloaded() == 0
+            && failures.len() == 1
+            && failures[0].error().kind() == &ErrorKind::IOError,
+        "downloaded {} objects, failures {failures:?}",
+        downloaded.objects_downloaded()
+    );
+    ensure_same(
+        &outside.display().to_string(),
+        b"existing",
+        &read(&outside)?,
+    )?;
+    shut_down(client, before, store).await
 }
 
 /// Hundreds of small files upload and download as a directory.
