@@ -35,8 +35,9 @@ use std::{
 /// replaced by a link between two file operations of its key; a replacement
 /// during a single operation is not detected. A link at a key's own path is
 /// replaced by the downloaded file, not followed. The destination path itself
-/// is resolved again by each file operation. The destination and every
-/// existing directory under it must be readable as well as searchable. On other
+/// is resolved again by each file operation. A key fails unless the destination
+/// and every directory its path passes through are readable as well as
+/// searchable. On other
 /// platforms, including Windows, symbolic links and junctions inside the
 /// destination are followed, so a key's file can be written outside the
 /// destination.

@@ -374,10 +374,9 @@ mod dir {
             names: &[&Path],
             op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>,
         ) -> io::Result<T> {
-            let plain = |name: &&Path| {
-                let mut components = name.components();
-                matches!(components.next(), Some(Component::Normal(_)))
-                    && components.next().is_none()
+            let plain = |name: &&Path| match name.components().next() {
+                Some(Component::Normal(n)) => n == name.as_os_str(),
+                _ => false,
             };
             if self.0.is_some() && !names.iter().all(plain) {
                 return Err(Errno::INVAL.into());
@@ -1239,11 +1238,15 @@ mod tests {
         let error = Dir::create_beneath(&root.path().join("in"), Path::new("../out")).unwrap_err();
         let dir = Dir::create_beneath(root.path(), Path::new("in")).unwrap();
         let parent_name = create_first_new(&dir, [PathBuf::from("..")]).unwrap_err();
-        let nested_name = create_first_new(&dir, [PathBuf::from("x/out")]).unwrap_err();
+        let nested_names = ["x/out", "x/.", "x/"].map(|name| {
+            create_first_new(&dir, [PathBuf::from(name)])
+                .unwrap_err()
+                .kind()
+        });
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(parent_name.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(nested_name.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(nested_names, [io::ErrorKind::InvalidInput; 3]);
         assert!(!root.path().join("out").exists());
     }
 
