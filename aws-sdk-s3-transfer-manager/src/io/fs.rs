@@ -385,6 +385,8 @@ mod dir {
             Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
         }
 
+        /// Creates `name` exclusively and opens it for writing; fails with
+        /// `AlreadyExists` if any entry has that name.
         pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
             let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
             let mode = Mode::from_raw_mode(0o666);
@@ -392,10 +394,12 @@ mod dir {
                 .map(File::from)
         }
 
+        /// Renames `from` to `to`, replacing any entry named `to`.
         pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             self.at(&[from, to], |dir| rustix::fs::renameat(dir, from, dir, to))
         }
 
+        /// Removes the file `name`.
         pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
             self.at(&[name], |dir| {
                 rustix::fs::unlinkat(dir, name, AtFlags::empty())
@@ -422,16 +426,20 @@ mod dir {
     pub(crate) struct Dir(PathBuf);
 
     impl Dir {
+        /// The current directory, in which names resolve as plain paths.
         pub(crate) fn cwd() -> Self {
             Self(PathBuf::new())
         }
 
+        /// Creates the missing directories of `relative` beneath `root`.
         pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
             let path = root.join(relative);
             std::fs::create_dir_all(&path)?;
             Ok(Self(path))
         }
 
+        /// Creates `name` exclusively and opens it for writing; fails with
+        /// `AlreadyExists` if any entry has that name.
         pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
             File::options()
                 .write(true)
@@ -439,10 +447,12 @@ mod dir {
                 .open(self.0.join(name))
         }
 
+        /// Renames `from` to `to`, replacing any entry named `to`.
         pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             std::fs::rename(self.0.join(from), self.0.join(to))
         }
 
+        /// Removes the file `name`.
         pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
             std::fs::remove_file(self.0.join(name))
         }
