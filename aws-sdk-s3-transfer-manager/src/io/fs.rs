@@ -309,7 +309,9 @@ mod dir {
     /// Holds a root and a path beneath it, or `None` for the current
     /// directory. Each operation opens the directory again from its root, one
     /// component at a time without following symbolic links, so no operation
-    /// reaches outside the root even if a component is replaced in between.
+    /// reaches outside the root even if a component is replaced between
+    /// operations. A directory moved during an operation, after its walk, still
+    /// receives it.
     /// Names passed to an operation resolve directly in the directory and must
     /// be single components, except in [`Dir::cwd`], where they are paths.
     #[derive(Debug)]
