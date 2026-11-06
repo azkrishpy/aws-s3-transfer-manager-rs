@@ -37,10 +37,9 @@ use std::{
 /// replaced by the downloaded file, not followed. The destination path itself
 /// is resolved again by each file operation. A key fails unless the destination
 /// and every directory its path passes through are readable as well as
-/// searchable. On other
-/// platforms, including Windows, symbolic links and junctions inside the
-/// destination are followed, so a key's file can be written outside the
-/// destination.
+/// searchable. On other platforms, including Windows, symbolic links and
+/// junctions inside the destination are followed, so a key's file can be
+/// written outside the destination.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct DownloadObjectsInput {
