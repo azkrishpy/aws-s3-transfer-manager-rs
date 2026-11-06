@@ -1174,6 +1174,27 @@ mod tests {
         }
     }
 
+    /// A directory `create_beneath` cannot create reports why, not that it is
+    /// missing.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn dir_create_beneath_reports_why_a_directory_was_not_created() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the permission bits.
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("ro")).unwrap();
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(root.path().join("ro"), ro).unwrap();
+
+        let error = Dir::create_beneath(root.path(), Path::new("ro/new")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     /// A directory replaced by a symbolic link after `create_beneath` still
     /// receives the rename, and the link's target is untouched.
     #[cfg(unix)]
