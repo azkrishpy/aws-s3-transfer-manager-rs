@@ -5,7 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [vNext] - Unreleased
+
+### Fixed
+- `upload_objects` and `download_objects` could map two inputs to one output and report both as
+  uploaded or downloaded while the later write replaced the earlier one. `upload_objects` now fails a
+  file whose key another file already derived, such as names that aren't valid Unicode and differ
+  only in those bytes, or `a-/b` and `a/-b` with the delimiter `--`. `download_objects` now fails a
+  key whose local path another key already claimed, such as `a//b` and `a/b`, or keys that differ
+  only by case on macOS and Windows. The failure has `ErrorKind::InputInvalid`, names the other
+  input, and follows the `FailedTransferPolicy`.
+
+## [release-2026-11-05]
 
 ### Added
 - `aws-smithy-topology` 0.1.0: CPU and NUMA discovery, execution placement targets, and
@@ -56,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent, or a worker panic sends no AbortMultipartUpload; it now logs the ID of a multipart upload
   it leaves open at `WARN`.
   ([#226](https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/226))
+- A finished transfer could be retained for the life of the process, and the client with it:
+  dropping the `Client` did not shut down its runtime. A download to disk (`write_to_path`,
+  `write_to_file`, or `download_objects`) kept its file open, preventing opens that deny write
+  sharing on Windows and keeping deleted files' storage allocated. Ready-set entries now hold weak
+  descriptors, so transfers and their resources are released when the registry and remaining
+  transient owners retire, without waiting for epoch reclamation. The destination file can remain
+  open after `join` or `abort` returns while transfer cleanup finishes.
 
 ## [0.3.1] - 2026-10-09
 
