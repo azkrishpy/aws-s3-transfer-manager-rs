@@ -292,6 +292,10 @@ pub(crate) use dir::Dir;
 
 #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
 mod dir {
+    //! Directory-relative operations through rustix. Miri, whose file-system
+    //! emulation does not cover directory-relative `*at` calls, uses the
+    //! path-based module instead.
+
     use rustix::fs::{AtFlags, Mode, OFlags, CWD};
     use rustix::io::Errno;
     use std::fs::File;
@@ -384,6 +388,8 @@ mod dir {
 
 #[cfg(not(all(any(unix, target_os = "wasi"), not(miri))))]
 mod dir {
+    //! Path-based operations for other targets and Miri.
+
     use std::fs::File;
     use std::io;
     use std::path::{Path, PathBuf};
