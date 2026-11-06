@@ -320,12 +320,12 @@ mod dir {
         /// it.
         pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
             let dir = Self(Some((root.into(), relative.into())));
-            dir.open(true)?;
+            dir.open()?;
             Ok(dir)
         }
 
-        /// Opens the directory, creating missing components if `create`.
-        fn open(&self, create: bool) -> io::Result<Option<OwnedFd>> {
+        /// Opens the directory, creating missing components.
+        fn open(&self) -> io::Result<Option<OwnedFd>> {
             let Some((root, relative)) = &self.0 else {
                 return Ok(None);
             };
@@ -335,10 +335,7 @@ mod dir {
                 let name = name.as_os_str();
                 // As `create_dir_all` does, a failed `mkdirat` matters only if
                 // the directory is then missing.
-                let made = match create {
-                    true => rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)),
-                    false => Ok(()),
-                };
+                let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
                 dir = match rustix::fs::openat(&dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
                 {
                     Err(Errno::NOENT) => return Err(made.err().unwrap_or(Errno::NOENT).into()),
@@ -349,7 +346,7 @@ mod dir {
         }
 
         fn at<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>) -> io::Result<T> {
-            let dir = self.open(false)?;
+            let dir = self.open()?;
             Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
         }
 

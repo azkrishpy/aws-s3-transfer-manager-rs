@@ -47,10 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `download_objects` followed a directory symbolic link inside the destination, so a key under
   it could replace a file outside the destination. On Unix and WASI a key whose path passes
   through any symbolic link inside the destination, even one pointing inside it, now fails and is
-  handled by the failure policy; a key that maps to the destination directory itself fails with
-  `InputInvalid` before its download starts. The destination and the directories under it must
-  now be readable as well as searchable. Windows still follows links and junctions inside the
-  destination.
+  handled by the failure policy. A key that maps to the destination directory itself, which could
+  replace a destination that is a symbolic link, fails with `InputInvalid` before its download
+  starts. The destination and the directories under it must now be readable as well as
+  searchable. Windows still follows links and junctions inside the destination.
 - `ByteUnit::as_bits_usize` defined `Gibibyte` as `1 << 33`, which overflows a 32-bit `usize`
   and stopped the crate from compiling on such targets. `as_bits_u64` now computes every unit in
   `u64`, and `as_bits_usize` panics for `Gibibyte` where `usize` is 32 bits. Values on 64-bit
