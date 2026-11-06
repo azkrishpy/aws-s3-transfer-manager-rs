@@ -15,7 +15,8 @@
 //! [`is_append_only`] reports whether a handle's positioned writes would land
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry,
-//! in a [`Dir`].
+//! in a [`Dir`]. On Unix and WASI no operation of a [`Dir`] follows a symbolic
+//! link below its root; elsewhere a [`Dir`] resolves plain paths.
 //! [`Handle`] identifies the file a path names, so that two paths can be
 //! compared.
 //!
@@ -305,7 +306,7 @@ mod dir {
     /// component at a time without following symbolic links, so no operation
     /// reaches outside the root even if a component is replaced in between.
     /// Names passed to an operation resolve directly in the directory and must
-    /// be single components.
+    /// be single components, except in [`Dir::cwd`], where they are paths.
     #[derive(Debug)]
     pub(crate) struct Dir(Option<(PathBuf, PathBuf)>);
 
@@ -338,15 +339,21 @@ mod dir {
                 let Component::Normal(name) = name else {
                     return Err(Errno::INVAL.into());
                 };
-                // As `create_dir_all` does, a failed `mkdirat` matters only if
-                // the directory is then missing.
-                let made = match create {
-                    true => rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)),
-                    false => Ok(()),
+                let open = |dir: &OwnedFd| {
+                    rustix::fs::openat(dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
                 };
-                dir = match rustix::fs::openat(&dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
-                {
-                    Err(Errno::NOENT) => return Err(made.err().unwrap_or(Errno::NOENT).into()),
+                dir = match open(&dir) {
+                    // As `create_dir_all` does, a failed `mkdirat` matters only
+                    // if the directory is then missing.
+                    Err(Errno::NOENT) if create => {
+                        let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
+                        match open(&dir) {
+                            Err(Errno::NOENT) => {
+                                return Err(made.err().unwrap_or(Errno::NOENT).into())
+                            }
+                            result => result?,
+                        }
+                    }
                     result => result?,
                 };
             }
@@ -385,7 +392,8 @@ mod dir {
     ///
     /// Holds the directory's path, which each operation resolves again,
     /// following symbolic links. Names passed to an operation resolve in the
-    /// directory and must be single components.
+    /// directory and must be single components, except in [`Dir::cwd`], where
+    /// they are paths.
     #[derive(Debug)]
     pub(crate) struct Dir(PathBuf);
 

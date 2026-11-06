@@ -516,8 +516,9 @@ impl DownloadObjectsTransfer {
             self.inner.delimiter.as_deref(),
         )?;
 
-        // Resolve the key's directories one at a time beneath the destination,
-        // so a directory symlink there cannot lead the download outside it.
+        // On Unix and WASI, resolve the key's directories one at a time beneath
+        // the destination, so a directory symlink there cannot lead the download
+        // outside it.
         //
         // TODO(vnext): revisit moving this to the execute phase. poll_work is
         // documented as non-blocking, but the scheduler is edge-triggered so
