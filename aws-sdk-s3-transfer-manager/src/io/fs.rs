@@ -1238,10 +1238,12 @@ mod tests {
 
         let error = Dir::create_beneath(&root.path().join("in"), Path::new("../out")).unwrap_err();
         let dir = Dir::create_beneath(root.path(), Path::new("in")).unwrap();
-        let name_error = create_first_new(&dir, [PathBuf::from("../out")]).unwrap_err();
+        let parent_name = create_first_new(&dir, [PathBuf::from("..")]).unwrap_err();
+        let nested_name = create_first_new(&dir, [PathBuf::from("x/out")]).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(name_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(parent_name.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(nested_name.kind(), io::ErrorKind::InvalidInput);
         assert!(!root.path().join("out").exists());
     }
 
