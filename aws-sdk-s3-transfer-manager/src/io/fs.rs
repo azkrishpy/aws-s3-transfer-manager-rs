@@ -301,7 +301,7 @@ mod dir {
     use std::fs::File;
     use std::io;
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     /// The root and the path beneath it; `None` is the current directory.
     #[derive(Debug)]
@@ -317,7 +317,8 @@ mod dir {
         ///
         /// `root` may be a symbolic link. A component of `relative` that is a
         /// symbolic link fails with the platform's error for refusing to follow
-        /// it.
+        /// it, and one that is not a plain name, such as `..`, fails with
+        /// [`io::ErrorKind::InvalidInput`].
         pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
             let dir = Self(Some((root.into(), relative.into())));
             dir.open(true)?;
@@ -332,7 +333,9 @@ mod dir {
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
             let mut dir = rustix::fs::open(root, flags, Mode::empty())?;
             for name in relative.components() {
-                let name = name.as_os_str();
+                let Component::Normal(name) = name else {
+                    return Err(Errno::INVAL.into());
+                };
                 // As `create_dir_all` does, a failed `mkdirat` matters only if
                 // the directory is then missing.
                 let made = match create {
@@ -1186,6 +1189,21 @@ mod tests {
         for (i, path) in taken.iter().enumerate() {
             assert_eq!(std::fs::read(path).unwrap(), [i as u8]);
         }
+    }
+
+    /// `create_beneath` refuses a component that is not a plain name, so `..`
+    /// cannot climb out of the root.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn dir_create_beneath_refuses_parent_components() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("in")).unwrap();
+
+        let error = Dir::create_beneath(&root.path().join("in"), Path::new("../out")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!root.path().join("out").exists());
     }
 
     /// A directory `create_beneath` cannot create reports why, not that it is
