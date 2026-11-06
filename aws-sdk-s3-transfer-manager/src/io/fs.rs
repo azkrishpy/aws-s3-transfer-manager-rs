@@ -15,8 +15,9 @@
 //! [`is_append_only`] reports whether a handle's positioned writes would land
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry,
-//! in a [`Dir`]. On Unix and WASI no operation of a [`Dir`] follows a symbolic
-//! link below its root; elsewhere a [`Dir`] resolves plain paths.
+//! in a [`Dir`]. On Unix and WASI (not Miri) no operation of a [`Dir`]
+//! follows a symbolic link below its root; elsewhere a [`Dir`] resolves plain
+//! paths.
 //! [`Handle`] identifies the file a path names, so that two paths can be
 //! compared.
 //!
