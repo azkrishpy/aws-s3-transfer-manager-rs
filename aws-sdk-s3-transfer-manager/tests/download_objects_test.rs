@@ -313,6 +313,106 @@ async fn test_failed_download_policy_continue() {
     assert_eq!(Some("key3"), failed_transfer.input().key());
 }
 
+/// Downloads `keys` with `policy` into `<root>/destination`, a symlink to `<root>/real`, where
+/// `real/dir` is a symlink to `<root>/outside`, which holds `a`.
+async fn download_into_symlinked_destination(
+    keys: &[&str],
+    policy: FailedTransferPolicy,
+) -> (
+    tempfile::TempDir,
+    Result<
+        aws_sdk_s3_transfer_manager::operation::download_objects::DownloadObjectsOutput,
+        aws_sdk_s3_transfer_manager::error::Error,
+    >,
+) {
+    let bucket = keys
+        .iter()
+        .fold(MockBucket::builder(), |b, key| b.key_with_size(*key, 5))
+        .build();
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("real")).unwrap();
+    std::fs::create_dir(root.path().join("outside")).unwrap();
+    std::fs::write(root.path().join("outside/a"), "existing local data").unwrap();
+    std::os::unix::fs::symlink("real", root.path().join("destination")).unwrap();
+    std::os::unix::fs::symlink("../outside", root.path().join("real/dir")).unwrap();
+
+    let result = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(root.path().join("destination"))
+        .failure_policy(policy)
+        .initiate()
+        .unwrap()
+        .join()
+        .await;
+    (root, result)
+}
+
+/// Under `Continue`, a key under a directory symlink inside the destination and a key that maps
+/// to the destination itself fail, other keys download through a symlinked destination, a key
+/// named like the symlink replaces it, and nothing is written anywhere else.
+#[tokio::test]
+async fn test_directory_symlink_in_destination_fails_continue() {
+    let (root, result) = download_into_symlinked_destination(
+        &["dir/a", "b", "dir", "x/.."],
+        FailedTransferPolicy::Continue,
+    )
+    .await;
+    let output = result.unwrap();
+
+    assert_eq!(2, output.objects_downloaded());
+    let mut failures: Vec<_> = output
+        .failed_transfers()
+        .iter()
+        .map(|f| (f.input().key().unwrap(), f.error().kind().clone()))
+        .collect();
+    failures.sort_by_key(|(key, _)| *key);
+    assert_eq!(
+        vec![
+            ("dir/a", ErrorKind::IOError),
+            ("x/..", ErrorKind::InputInvalid)
+        ],
+        failures
+    );
+    assert_eq!(
+        vec!["destination", "outside/a", "real/b", "real/dir"],
+        relative_path_names(root.path()).unwrap()
+    );
+    assert!(std::fs::symlink_metadata(root.path().join("real/dir"))
+        .unwrap()
+        .is_file());
+    assert_eq!(
+        "existing local data",
+        std::fs::read_to_string(root.path().join("outside/a")).unwrap()
+    );
+}
+
+/// Under `Abort`, a key under a directory symlink inside the destination fails the operation.
+#[tokio::test]
+async fn test_directory_symlink_in_destination_fails_abort() {
+    let (root, result) =
+        download_into_symlinked_destination(&["dir/a"], FailedTransferPolicy::Abort).await;
+    let err = result.unwrap_err();
+
+    assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+    let failed = err.failed_downloads().unwrap();
+    assert_eq!(1, failed.len());
+    assert_eq!(Some("dir/a"), failed[0].input().key());
+    assert_eq!(&ErrorKind::IOError, failed[0].error().kind());
+    assert_eq!(
+        "existing local data",
+        std::fs::read_to_string(root.path().join("outside/a")).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_recursively_downloads() {
     let mut expected_keys = vec![

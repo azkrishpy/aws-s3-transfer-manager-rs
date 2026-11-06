@@ -14,7 +14,10 @@
 //!
 //! [`is_append_only`] reports whether a handle's positioned writes would land
 //! at their offsets, and [`create_first_new`] creates the first of several
-//! candidate paths that does not exist yet, without opening any existing entry.
+//! candidate paths that does not exist yet, without opening any existing entry,
+//! in a [`Dir`]. On Unix and WASI (not Miri) no operation of a [`Dir`]
+//! follows a symbolic link below its root; elsewhere a [`Dir`] resolves plain
+//! paths.
 //! [`Handle`] identifies the file a path names, so that two paths can be
 //! compared.
 //!
@@ -223,10 +226,10 @@ pub(crate) fn is_append_only(file: &File) -> io::Result<bool> {
     sys::is_append_only(file)
 }
 
-/// Creates the first of `candidates` that does not exist yet and opens it for
-/// writing.
+/// Creates the first of `candidates`, named in `dir`, that does not exist yet
+/// and opens it for writing.
 ///
-/// Each candidate is opened with
+/// Each candidate is created exclusively, like
 /// [`create_new`](std::fs::OpenOptions::create_new), so it succeeds only if no
 /// entry, including a dangling symbolic link, exists at that path. An existing
 /// entry is never opened, truncated, or followed; the next candidate is tried
@@ -237,12 +240,13 @@ pub(crate) fn is_append_only(file: &File) -> io::Result<bool> {
 /// entry, or there were none. Any other error from opening a candidate is
 /// returned at once.
 pub(crate) fn create_first_new(
+    dir: &Dir,
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
     let mut tried = 0;
     for path in candidates {
         tried += 1;
-        match File::options().write(true).create_new(true).open(&path) {
+        match dir.create_new(&path) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -254,35 +258,15 @@ pub(crate) fn create_first_new(
     ))
 }
 
-/// Runs [`create_first_new`] on the blocking thread pool, or inline on wasm
-/// targets.
+/// Runs [`create_first_new`] in the current directory on the blocking thread
+/// pool, or inline on wasm targets.
 ///
 /// Returns its result, or an error if the blocking task panics or is
 /// cancelled.
 pub(crate) async fn create_first_new_async(
     candidates: Vec<PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
-    run_blocking(move || create_first_new(candidates)).await
-}
-
-/// Renames `from` to `to`.
-///
-/// Uses [`tokio::fs::rename`], or [`std::fs::rename`] on the calling thread on
-/// wasm targets, where tokio's blocking pool is unavailable. Returns the
-/// rename's result.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
-    tokio::fs::rename(from, to).await
-}
-
-/// Renames `from` to `to`.
-///
-/// Uses [`tokio::fs::rename`], or [`std::fs::rename`] on the calling thread on
-/// wasm targets, where tokio's blocking pool is unavailable. Returns the
-/// rename's result.
-#[cfg(target_family = "wasm")]
-pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::rename(from, to)
+    run_blocking(move || create_first_new(&Dir::cwd(), candidates)).await
 }
 
 /// Removes the file at `path`.
@@ -305,12 +289,182 @@ pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
 
+pub(crate) use dir::Dir;
+
+#[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
+mod dir {
+    //! Directory-relative operations through rustix. Miri, whose file-system
+    //! emulation does not cover directory-relative `*at` calls, uses the
+    //! path-based module instead.
+
+    use rustix::fs::{AtFlags, Mode, OFlags, CWD};
+    use rustix::io::Errno;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::path::{Component, Path, PathBuf};
+
+    /// A directory in which files are created, renamed and removed by name.
+    ///
+    /// Holds a root and a path beneath it, or `None` for the current
+    /// directory. Each operation opens the directory again from its root, one
+    /// component at a time without following symbolic links, so no operation
+    /// reaches outside the root even if a component is replaced between
+    /// operations. A directory moved during an operation, after its walk, still
+    /// receives it.
+    /// Names passed to an operation resolve directly in the directory and must
+    /// be single components, except in [`Dir::cwd`], where they are paths.
+    #[derive(Debug)]
+    pub(crate) struct Dir(Option<(PathBuf, PathBuf)>);
+
+    impl Dir {
+        /// The current directory, in which names resolve as plain paths.
+        pub(crate) fn cwd() -> Self {
+            Self(None)
+        }
+
+        /// Creates the missing directories of `relative` beneath `root`.
+        ///
+        /// `root` may be a symbolic link. A component of `relative` that is a
+        /// symbolic link fails with the platform's error for refusing to follow
+        /// it, and one that is not a plain name, such as `..`, fails with
+        /// [`io::ErrorKind::InvalidInput`].
+        pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
+            let dir = Self(Some((root.into(), relative.into())));
+            dir.open(true)?;
+            Ok(dir)
+        }
+
+        /// Opens the directory, creating missing components if `create`.
+        fn open(&self, create: bool) -> io::Result<Option<OwnedFd>> {
+            let Some((root, relative)) = &self.0 else {
+                return Ok(None);
+            };
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let mut dir = rustix::fs::open(root, flags, Mode::empty())?;
+            for name in relative.components() {
+                let Component::Normal(name) = name else {
+                    return Err(Errno::INVAL.into());
+                };
+                let open = |dir: &OwnedFd| {
+                    rustix::fs::openat(dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
+                };
+                dir = match open(&dir) {
+                    // As `create_dir_all` does, a failed `mkdirat` matters only
+                    // if the directory is then missing.
+                    Err(Errno::NOENT) if create => {
+                        let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
+                        match open(&dir) {
+                            Err(Errno::NOENT) => {
+                                return Err(made.err().unwrap_or(Errno::NOENT).into())
+                            }
+                            result => result?,
+                        }
+                    }
+                    result => result?,
+                };
+            }
+            Ok(Some(dir))
+        }
+
+        /// Runs `op` in the directory, after checking that each of `names` is a
+        /// single plain component when the directory has a root.
+        fn at<T>(
+            &self,
+            names: &[&Path],
+            op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>,
+        ) -> io::Result<T> {
+            let plain = |name: &&Path| match name.components().next() {
+                Some(Component::Normal(n)) => n == name.as_os_str(),
+                _ => false,
+            };
+            if self.0.is_some() && !names.iter().all(plain) {
+                return Err(Errno::INVAL.into());
+            }
+            let dir = self.open(false)?;
+            Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
+        }
+
+        /// Creates `name` exclusively and opens it for writing; fails with
+        /// `AlreadyExists` if any entry has that name.
+        pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
+            let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+            let mode = Mode::from_raw_mode(0o666);
+            self.at(&[name], |dir| rustix::fs::openat(dir, name, flags, mode))
+                .map(File::from)
+        }
+
+        /// Renames `from` to `to`, replacing any entry named `to`.
+        pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.at(&[from, to], |dir| rustix::fs::renameat(dir, from, dir, to))
+        }
+
+        /// Removes the file `name`.
+        pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
+            self.at(&[name], |dir| {
+                rustix::fs::unlinkat(dir, name, AtFlags::empty())
+            })
+        }
+    }
+}
+
+#[cfg(not(all(any(unix, target_os = "wasi"), not(miri))))]
+mod dir {
+    //! Path-based operations for other targets and Miri.
+
+    use std::fs::File;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// A directory in which files are created, renamed and removed by name.
+    ///
+    /// Holds the directory's path, which each operation resolves again,
+    /// following symbolic links. Names passed to an operation resolve in the
+    /// directory and must be single components, except in [`Dir::cwd`], where
+    /// they are paths.
+    #[derive(Debug)]
+    pub(crate) struct Dir(PathBuf);
+
+    impl Dir {
+        /// The current directory, in which names resolve as plain paths.
+        pub(crate) fn cwd() -> Self {
+            Self(PathBuf::new())
+        }
+
+        /// Creates the missing directories of `relative` beneath `root`.
+        pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
+            let path = root.join(relative);
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        /// Creates `name` exclusively and opens it for writing; fails with
+        /// `AlreadyExists` if any entry has that name.
+        pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(self.0.join(name))
+        }
+
+        /// Renames `from` to `to`, replacing any entry named `to`.
+        pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            std::fs::rename(self.0.join(from), self.0.join(to))
+        }
+
+        /// Removes the file `name`.
+        pub(crate) fn remove_file(&self, name: &Path) -> io::Result<()> {
+            std::fs::remove_file(self.0.join(name))
+        }
+    }
+}
+
 /// Runs `operation` on tokio's blocking thread pool.
 ///
 /// Returns its result, or an error if the blocking task panics or is
 /// cancelled.
 #[cfg(not(target_family = "wasm"))]
-async fn run_blocking<T: Send + 'static>(
+pub(crate) async fn run_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     tokio::task::spawn_blocking(operation).await?
@@ -321,7 +475,7 @@ async fn run_blocking<T: Send + 'static>(
 /// wasip1 and wasip2 cannot spawn the threads a blocking pool needs, and
 /// wasip3's cooperative threads run one at a time.
 #[cfg(target_family = "wasm")]
-async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+pub(crate) async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     operation()
 }
 
@@ -1032,8 +1186,11 @@ mod tests {
         std::fs::write(&existing, b"CUSTOMER").unwrap();
         let free = dir.path().join("free");
 
-        let (file, path) =
-            create_first_new([existing.clone(), existing.clone(), free.clone()]).unwrap();
+        let (file, path) = create_first_new(
+            &Dir::cwd(),
+            [existing.clone(), existing.clone(), free.clone()],
+        )
+        .unwrap();
 
         assert_eq!(path, free);
         assert_handle_writes_path(file, &path);
@@ -1051,7 +1208,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let free = dir.path().join("free");
 
-        let (file, path) = create_first_new([link.clone(), free.clone()]).unwrap();
+        let (file, path) = create_first_new(&Dir::cwd(), [link.clone(), free.clone()]).unwrap();
 
         assert_eq!(path, free);
         assert_handle_writes_path(file, &path);
@@ -1070,12 +1227,83 @@ mod tests {
             })
             .collect();
 
-        let error = create_first_new(taken.clone()).unwrap_err();
+        let error = create_first_new(&Dir::cwd(), taken.clone()).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(error.to_string().contains("(3 tried)"), "{error}");
         for (i, path) in taken.iter().enumerate() {
             assert_eq!(std::fs::read(path).unwrap(), [i as u8]);
         }
+    }
+
+    /// A rooted `Dir` refuses a path component or a name that is not a single
+    /// plain component, so neither can climb out of the root.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn dir_refuses_components_that_are_not_plain_names() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("in")).unwrap();
+
+        let error = Dir::create_beneath(&root.path().join("in"), Path::new("../out")).unwrap_err();
+        let dir = Dir::create_beneath(root.path(), Path::new("in")).unwrap();
+        let parent_name = create_first_new(&dir, [PathBuf::from("..")]).unwrap_err();
+        let nested_names = ["x/out", "x/.", "x/"].map(|name| {
+            create_first_new(&dir, [PathBuf::from(name)])
+                .unwrap_err()
+                .kind()
+        });
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(parent_name.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(nested_names, [io::ErrorKind::InvalidInput; 3]);
+        assert!(!root.path().join("out").exists());
+    }
+
+    /// A directory `create_beneath` cannot create reports why, not that it is
+    /// missing.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn dir_create_beneath_reports_why_a_directory_was_not_created() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the permission bits.
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("ro")).unwrap();
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(root.path().join("ro"), ro).unwrap();
+
+        let error = Dir::create_beneath(root.path(), Path::new("ro/new")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// Publishing into a directory that was moved away fails without creating
+    /// it again, and still fails once a symbolic link at its old path leads to
+    /// where it went.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn dir_refuses_a_directory_replaced_by_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = Dir::create_beneath(root.path(), Path::new("a/b")).unwrap();
+        let (_, temp) = create_first_new(&dir, [PathBuf::from("f.tmp")]).unwrap();
+        let names = |dir: &Path| -> Vec<_> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        };
+
+        std::fs::rename(root.path().join("a"), outside.path().join("a")).unwrap();
+        dir.rename(&temp, Path::new("f")).unwrap_err();
+        assert!(names(root.path()).is_empty());
+
+        std::os::unix::fs::symlink(outside.path().join("a"), root.path().join("a")).unwrap();
+        dir.rename(&temp, Path::new("f")).unwrap_err();
     }
 }

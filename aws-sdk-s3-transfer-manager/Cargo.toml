@@ -56,9 +56,9 @@ tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs"] }
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 same-file = "1.0.6"
 
-# Safe wrappers for WASI positioned I/O, descriptor flags, and file identity. std's equivalents
-# (`std::os::wasi::fs`) are unstable.
-[target.'cfg(target_os = "wasi")'.dependencies]
+# Directory-relative file operations on Unix and WASI, and safe wrappers for WASI positioned I/O,
+# descriptor flags, and file identity. std's WASI equivalents (`std::os::wasi::fs`) are unstable.
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [features]
