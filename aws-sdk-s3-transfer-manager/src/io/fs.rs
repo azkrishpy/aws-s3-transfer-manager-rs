@@ -320,12 +320,12 @@ mod dir {
         /// it.
         pub(crate) fn create_beneath(root: &Path, relative: &Path) -> io::Result<Self> {
             let dir = Self(Some((root.into(), relative.into())));
-            dir.open()?;
+            dir.open(true)?;
             Ok(dir)
         }
 
-        /// Opens the directory, creating missing components.
-        fn open(&self) -> io::Result<Option<OwnedFd>> {
+        /// Opens the directory, creating missing components if `create`.
+        fn open(&self, create: bool) -> io::Result<Option<OwnedFd>> {
             let Some((root, relative)) = &self.0 else {
                 return Ok(None);
             };
@@ -335,7 +335,10 @@ mod dir {
                 let name = name.as_os_str();
                 // As `create_dir_all` does, a failed `mkdirat` matters only if
                 // the directory is then missing.
-                let made = rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777));
+                let made = match create {
+                    true => rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)),
+                    false => Ok(()),
+                };
                 dir = match rustix::fs::openat(&dir, name, flags | OFlags::NOFOLLOW, Mode::empty())
                 {
                     Err(Errno::NOENT) => return Err(made.err().unwrap_or(Errno::NOENT).into()),
@@ -346,7 +349,7 @@ mod dir {
         }
 
         fn at<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<T>) -> io::Result<T> {
-            let dir = self.open()?;
+            let dir = self.open(false)?;
             Ok(op(dir.as_ref().map_or(CWD, AsFd::as_fd))?)
         }
 
@@ -1206,30 +1209,30 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
-    /// Once a directory's path is replaced by a symbolic link, neither
-    /// publishing nor creating a file there reaches the link's target.
+    /// Publishing into a directory that was moved away fails without creating
+    /// it again, and still fails once a symbolic link at its old path leads to
+    /// where it went.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn dir_refuses_a_directory_replaced_by_a_symlink() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::fs::create_dir(outside.path().join("b")).unwrap();
         let dir = Dir::create_beneath(root.path(), Path::new("a/b")).unwrap();
         let (_, temp) = create_first_new(&dir, [PathBuf::from("f.tmp")]).unwrap();
-
-        std::fs::rename(root.path().join("a"), root.path().join("moved")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("a")).unwrap();
-        dir.rename(&temp, Path::new("f")).unwrap_err();
-        create_first_new(&dir, [PathBuf::from("g.tmp")]).unwrap_err();
-
         let names = |dir: &Path| -> Vec<_> {
             std::fs::read_dir(dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
                 .collect()
         };
-        assert_eq!(names(&root.path().join("moved/b")), ["f.tmp"]);
-        assert!(names(&outside.path().join("b")).is_empty());
+
+        std::fs::rename(root.path().join("a"), outside.path().join("a")).unwrap();
+        dir.rename(&temp, Path::new("f")).unwrap_err();
+        assert!(names(root.path()).is_empty());
+
+        std::os::unix::fs::symlink(outside.path().join("a"), root.path().join("a")).unwrap();
+        dir.rename(&temp, Path::new("f")).unwrap_err();
+        assert_eq!(names(&outside.path().join("a/b")), ["f.tmp"]);
     }
 }

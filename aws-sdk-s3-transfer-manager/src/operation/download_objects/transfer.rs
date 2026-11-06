@@ -535,10 +535,7 @@ impl DownloadObjectsTransfer {
         let dir = Dir::create_beneath(&self.inner.destination, parent).map_err(|e| {
             error::Error::new(
                 ErrorKind::IOError,
-                format!(
-                    "failed to create directory for key '{key}' (symbolic links inside the \
-                     destination are refused on Unix and WASI): {e}"
-                ),
+                format!("failed to create directory for key '{key}': {e}"),
             )
         })?;
 
