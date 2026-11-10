@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
 
+### Fixed
+- `upload_objects` with a custom delimiter could derive one key from two files, such as `a-/b` and
+  `a/-b` with the delimiter `--`, and report both as uploaded while the later write replaced the
+  earlier one. It now fails the second file with `ErrorKind::InputInvalid`, names the first file, and
+  follows the `FailedTransferPolicy`. The default and native delimiters keep no key registry.
+
 ## [release-2026-11-05]
 
 ### Added
