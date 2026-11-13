@@ -28,6 +28,18 @@ use std::{
 /// whose local path resolves outside the destination, or to the destination
 /// directory itself, is not downloaded. It is reported as a failure and
 /// handled by the [`failure_policy`](Self::failure_policy).
+///
+/// On Unix and WASI, the destination may itself be a symbolic link, but a
+/// symbolic link inside it is not followed: a key whose path passes through
+/// one is reported as a failure the same way, including when a directory is
+/// replaced by a link between two file operations of its key; a replacement
+/// during a single operation is not detected. A link at a key's own path is
+/// replaced by the downloaded file, not followed. The destination path itself
+/// is resolved again by each file operation. A key fails unless the destination
+/// and every directory its path passes through are readable as well as
+/// searchable. On other platforms, including Windows, symbolic links and
+/// junctions inside the destination are followed, so a key's file can be
+/// written outside the destination.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct DownloadObjectsInput {

@@ -159,7 +159,12 @@ impl Download {
             }
         };
         let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        Ok(ManagedDownloadHandle::new(
+            inner,
+            crate::io::fs::Dir::cwd(),
+            temp_path,
+            dest_path,
+        ))
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
