@@ -28,7 +28,7 @@ use aws_s3_transfer::types::ByteSize;
 use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 
-mod fault_connector;
+pub(crate) mod fault_connector;
 
 use fault_connector::{io_fault_http_client, is_upload_part, FailCount};
 

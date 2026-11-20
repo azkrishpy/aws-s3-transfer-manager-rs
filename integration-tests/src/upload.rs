@@ -5,6 +5,7 @@
 
 //! Upload integration tests.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -360,7 +361,7 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
     let err = result.expect_err("a part checksum that does not match its body must fail");
     assert_eq!(err.operation_name(), Some("UploadPart"), "{err:?}");
     assert_eq!(err.code(), Some("BadDigest"), "{err:?}");
-    assert_eq!(recorder.count("UploadPart"), 1);
+    assert_eq!(recorder.part_numbers(), BTreeSet::from([1]));
     assert_eq!(recorder.count("CompleteMultipartUpload"), 0);
 
     handle.shutdown().await.expect("shutdown");

@@ -14,6 +14,8 @@
 //! The checksums are supplied by the client, so every test runs the same assertions on the mock
 //! and on real S3, in a general purpose and a directory bucket.
 
+use std::collections::BTreeSet;
+
 use aws_s3_transfer::io::{InputStream, PartData};
 use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use aws_sdk_s3::types::ChecksumType;
@@ -110,7 +112,10 @@ async fn path_many_parts_intact(target: Target) {
         .expect("upload");
 
     let parts = object.stored_part_sizes().len();
-    assert_eq!(recorder.count("UploadPart"), parts);
+    assert_eq!(
+        recorder.part_numbers(),
+        (1..=parts as u32).collect::<BTreeSet<_>>()
+    );
     assert_eq!(t.head_part(KEY, 1).await.parts_count(), Some(parts as i32));
     assert_eq!(
         stored_checksum(&t, KEY).await,
@@ -242,7 +247,7 @@ async fn part_stream_full_object_mismatch(target: Target) {
         .await;
 
     assert_bad_digest(result, "CompleteMultipartUpload");
-    assert_eq!(recorder.count("UploadPart"), 3);
+    assert_eq!(recorder.part_numbers(), BTreeSet::from([1, 2, 3]));
     assert_eq!(recorder.count("AbortMultipartUpload"), 1);
     assert_nothing_stored(&t, KEY).await;
     t.shutdown().await;
