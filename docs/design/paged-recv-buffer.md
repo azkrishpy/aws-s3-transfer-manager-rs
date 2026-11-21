@@ -278,18 +278,21 @@ scopes with precedence dynamic > request > client:
 - `handle.io_ctl().set_read_ahead(..)` — dynamic, on a running transfer.
 
 `Parts(n)` caps read-ahead at `n` parts of speculation beyond the part the consumer is waiting on, so
-`n + 1` are resident and `Parts(0)` is demand paging. `Auto` uses a fixed per-transfer cap
-(`DEFAULT_WINDOW_PARTS`), set well above the bandwidth-delay product of a 100 Gbps link so it does not
-bind a consumer that keeps pace. The knob resolves to a window in parts in one place,
-`window_parts_for`, used both at transfer construction and by the dynamic setter. The window is stored
-in an `AtomicU64` so the dynamic setter is a lock-free store the next gate read observes; the value is
-otherwise fixed for the transfer. I/O controls live on a `DownloadIoCtl`, separate from scheduling
-controls — data movement versus scheduling.
+`n + 1` are resident and `Parts(0)` is demand paging. `Auto` is the transfer's share of the client's
+memory budget: the budget in parts divided by the number of live downloads (`WindowShare`), never below
+`DEFAULT_WINDOW_PARTS` (sized above the bandwidth-delay product of a 100 Gbps link) or the whole budget,
+if smaller. A download running alone can therefore hold the whole budget, which a single object needs
+on hosts whose concurrency target exceeds a fixed part count; concurrent downloads split it. The share
+is recomputed on every gate read, so it follows downloads as they start and finish. The knob resolves to
+a stored window in one place, `window_parts_for`, used both at transfer construction and by the dynamic
+setter. The window is stored in an `AtomicU64` so the dynamic setter is a lock-free store the next gate
+read observes. I/O controls live on a `DownloadIoCtl`, separate from scheduling controls — data movement
+versus scheduling.
 
 The window is a per-transfer prefetch-depth ceiling, not pool-wide admission. Buffer-pool admission
-accounts planned demand and retained ownership across all users of the pool and under concurrency
-typically binds a transfer before its own window fills. The `Auto` window's job is only to keep a
-single uncontended transfer's pipeline full.
+accounts planned demand and retained ownership across all users of the pool. The `Auto` share keeps one
+download from holding more than its part of the budget while others run, and lets an uncontended
+download use all of it.
 
 ---
 
@@ -419,12 +422,11 @@ here, the occupancy gate. Without such a bound, resident memory grows without li
 
 ## Open Questions
 
-**`Auto`-mode resident-size adaptation.** The `Auto` window is a fixed per-transfer part count sized
-above a 100 Gbps BDP. It does not adapt to the actual object part size or to how much memory a
-transfer is truly resident. A window expressed in bytes, or adapted to observed part size, would
-bound small-part transfers more tightly and let large-part transfers keep fewer parts in flight.
-Buffer-pool admission typically binds first under concurrency; the per-transfer window keeps a
-single uncontended transfer's pipeline full.
+**`Auto`-mode resident-size adaptation.** The `Auto` share is counted in parts of the client's
+configured part size. It does not adapt to a transfer's effective part size (a stored-part layout can
+be larger) or to how much memory a transfer is truly resident; buffer-pool admission still bounds the
+bytes. A live download counts toward the share until its handle drops, so finished downloads whose
+handles are still held lower other shares toward the floor.
 
 **Cross-transfer arbitration stays in buffer-pool admission.** The window bounds one transfer.
 Reservations from every transfer sharing a pool enter the pool's FIFO. That preserves one configured

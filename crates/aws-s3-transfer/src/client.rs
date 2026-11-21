@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
+use crate::operation::download::read_ahead::WindowShare;
 use crate::runtime::sizing::{self, ResourcePlan, Signals};
 use crate::runtime::ExecutionRuntime;
 
@@ -37,6 +38,8 @@ pub(crate) struct Handle {
     pub(crate) buffer_pool: BufferPool,
     /// Resource plan resolved when the client was constructed.
     pub(crate) plan: ResourcePlan,
+    /// `Auto` read-ahead windows: the memory budget shared among live downloads.
+    pub(crate) read_ahead_share: Arc<WindowShare>,
     /// Per-bucket retry token bucket, cached so all operations and retries to a
     /// given bucket share one live token bucket. The SDK does not share a bucket
     /// across custom retry partitions, and a partition built per operation would
@@ -255,6 +258,10 @@ impl Handle {
                 controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 buffer_pool,
+                read_ahead_share: Arc::new(WindowShare::new(
+                    plan.ceiling_bytes as u64,
+                    plan.part_size,
+                )),
                 plan,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
@@ -407,6 +414,10 @@ impl Client {
                 controller,
                 telemetry,
                 buffer_pool,
+                read_ahead_share: Arc::new(WindowShare::new(
+                    plan.ceiling_bytes as u64,
+                    plan.part_size,
+                )),
                 plan,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }

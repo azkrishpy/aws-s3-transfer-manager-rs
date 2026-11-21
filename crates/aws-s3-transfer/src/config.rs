@@ -51,8 +51,9 @@ pub enum PartSize {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ReadAhead {
-    /// A limit that doesn't slow a consumer that keeps pace, so the memory
-    /// budget is the bound in practice. This is the default.
+    /// An equal share of the client's memory budget among the downloads
+    /// running at the time, so a download running alone may use all of it.
+    /// This is the default.
     #[default]
     Auto,
 

@@ -4,7 +4,7 @@
  */
 use aws_config::BehaviorVersion;
 use aws_s3_transfer::config::{ConcurrencyMode, PartSize, TargetThroughput};
-use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig, ReadAhead};
 use aws_s3_transfer::config::{RuntimeConfig, S3ClientConfig};
 use aws_s3_transfer::io::InputStream;
 use aws_s3_transfer::memory::BufferPool;
@@ -117,6 +117,10 @@ pub struct Args {
     /// Part size to use
     #[arg(long, default_value_t = 8388608)]
     part_size: u64,
+
+    /// Parts a download fetches beyond the one its consumer waits for (default: automatic)
+    #[arg(long)]
+    read_ahead_parts: Option<usize>,
 
     /// Enable tokio console (requires RUSTFLAGS="--cfg tokio_unstable")
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
@@ -557,6 +561,9 @@ async fn client_config(args: &Args, runtime_tracing: &RuntimeTracing) -> Result<
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(ByteSize::new(args.part_size)))
         .runtime_config(args.runtime.mode());
+    if let Some(parts) = args.read_ahead_parts {
+        loader = loader.read_ahead(ReadAhead::Parts(parts));
+    }
     if let Some(pool) = memory_pool()? {
         loader = loader.memory(MemoryConfig::Explicit(pool));
     }
