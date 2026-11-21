@@ -162,7 +162,7 @@ impl DownloadTransfer {
         let read_ahead = ReadAhead::new(window, ctx.handle.read_ahead_share.clone());
         // Couple the disk drain batch to the initial window, so a window below the
         // segment size drains in smaller runs from the first part.
-        writer.sync_drain_batch(read_ahead.window());
+        writer.sync_drain_batch(&read_ahead);
         let destination = if writer.has_sink() {
             DownloadDestination::File
         } else {
@@ -282,9 +282,7 @@ impl DownloadTransfer {
     pub(crate) fn set_read_ahead(&self, mode: &crate::config::ReadAhead) {
         let window = super::read_ahead::window_parts_for(mode);
         self.inner.read_ahead.set_window(window);
-        self.inner
-            .writer
-            .sync_drain_batch(self.inner.read_ahead.window());
+        self.inner.writer.sync_drain_batch(&self.inner.read_ahead);
     }
 
     /// Release one part of read-ahead occupancy for a stream delivery, then wake the
@@ -3785,7 +3783,18 @@ mod tests {
             disk_test_handle(crc32_object_client(Arc::clone(&object), None), part_size),
             &FileSinkFactory,
         );
-        transfer.inner.writer.sync_drain_batch(1);
+        // Drain each part as it fills, so the first range reaches the file.
+        transfer.inner.read_ahead.force_window(1);
+        transfer
+            .inner
+            .writer
+            .sync_drain_batch(&transfer.inner.read_ahead);
+        transfer
+            .inner
+            .read_ahead
+            .set_window(super::super::read_ahead::window_parts_for(
+                &crate::config::ReadAhead::Auto,
+            ));
         assert_first_range_succeeds(&transfer).await;
         let mut integrity = {
             let mut state = transfer.inner.state.lock().unwrap();

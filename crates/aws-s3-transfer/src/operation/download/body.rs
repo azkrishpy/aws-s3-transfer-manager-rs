@@ -453,8 +453,8 @@ impl BodyWriter {
     /// segment drains in smaller runs so the block surface never waits for a run it
     /// cannot accumulate. Capped at the segment size (the coalescing target). Called
     /// at construction and whenever the window changes.
-    pub(crate) fn sync_drain_batch(&self, window: u64) {
-        let batch = std::cmp::min(SEG_SIZE as u64, window.max(1)) as usize;
+    pub(crate) fn sync_drain_batch(&self, read_ahead: &super::read_ahead::ReadAhead) {
+        let batch = std::cmp::min(SEG_SIZE as u64, read_ahead.window().max(1)) as usize;
         self.buffer.set_drain_batch(batch);
     }
 
