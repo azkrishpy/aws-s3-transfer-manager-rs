@@ -108,6 +108,9 @@ pub(super) struct GroupState {
     /// SkipMap. Prevents duplicate entries when pop's re-insert races with
     /// insert_child's 0->1 transition.
     in_root: AtomicBool,
+    /// `group_vruntime` of the group's root-tree key, recorded when it entered
+    /// the root tree. Lets removal find the entry after `group_vruntime` moves.
+    root_vruntime: AtomicU64,
 }
 
 impl GroupState {
@@ -117,6 +120,7 @@ impl GroupState {
             group_vruntime,
             nr_queued: AtomicUsize::new(0),
             in_root: AtomicBool::new(false),
+            root_vruntime: AtomicU64::new(0),
         }
     }
 
@@ -420,11 +424,7 @@ impl ReadySet {
             } else {
                 group.group_vruntime()
             };
-            let key = GroupKey {
-                group_vruntime: gv,
-                group_id,
-            };
-            self.groups.insert(key, group);
+            self.enter_root(gv, group_id, group);
         }
         // Dropping the last descriptor can run transfer destructors that
         // re-enter the scheduler. Release the lookup lock first.
@@ -469,11 +469,7 @@ impl ReadySet {
             // insertion's 0-to-1 path. Only the CAS winner adds the group to
             // the root tree, preventing duplicate entries.
             if group.count() > 0 && group.state.try_enter_root() {
-                let new_key = GroupKey {
-                    group_vruntime: group.group_vruntime(),
-                    group_id: group_key.group_id,
-                };
-                self.groups.insert(new_key, group);
+                self.enter_root(group.group_vruntime(), group_key.group_id, group);
             }
 
             if let Some(descriptor) = descriptor {
@@ -503,19 +499,28 @@ impl ReadySet {
     /// `parent = Some(group_id)` will return `Err(OrphanedChild)`.
     pub(super) fn remove_group(&self, group_id: u64) {
         let removed = self.by_group.write().unwrap().remove(&group_id);
-        if removed.is_some() {
-            // Linear scan of root tree to find and remove the entry for this group.
-            // Acceptable because remove_group is called once per top-level transfer
-            // lifetime (terminal path only), not on the hot scheduling path.
-            let key = self
-                .groups
-                .iter()
-                .find(|entry| entry.key().group_id == group_id)
-                .map(|entry| *entry.key());
-            if let Some(k) = key {
-                self.groups.remove(&k);
-            }
+        if let Some(group) = removed {
+            self.groups.remove(&GroupKey {
+                group_vruntime: group.state.root_vruntime.load(Ordering::SeqCst),
+                group_id,
+            });
         }
+    }
+
+    /// Publish `group` in the root tree under `group_vruntime`. The caller holds
+    /// root presence (`in_root`).
+    fn enter_root(&self, group_vruntime: u64, group_id: u64, group: Arc<GroupQueue>) {
+        group
+            .state
+            .root_vruntime
+            .store(group_vruntime, Ordering::SeqCst);
+        self.groups.insert(
+            GroupKey {
+                group_vruntime,
+                group_id,
+            },
+            group,
+        );
     }
 
     /// Pre-register an empty group for `group_id` so subsequent child
@@ -596,15 +601,11 @@ impl ReadySet {
         // No CAS needed: we just created it, no one else has a reference.
         group.state.in_root.store(true, Ordering::SeqCst);
 
-        let key = GroupKey {
-            group_vruntime: root_min,
-            group_id,
-        };
         self.by_group
             .write()
             .unwrap()
             .insert(group_id, Arc::clone(&group));
-        self.groups.insert(key, group);
+        self.enter_root(root_min, group_id, group);
     }
 
     fn insert_child(
@@ -1054,6 +1055,23 @@ mod tests {
             p1.vruntime(),
             p2.vruntime()
         );
+    }
+
+    /// Removal finds the root entry by the vruntime the group entered with, not
+    /// by the group's current vruntime.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn remove_group_unlinks_a_group_whose_vruntime_moved_in_the_root() {
+        let set = ReadySet::new();
+        set.insert(make_descriptor(1, None, 128, 0)).unwrap();
+        set.insert(make_descriptor(11, Some(1), 128, 0)).unwrap();
+        set.advance_group_vruntime(1, 1000);
+        // The pop re-enters the group, with its child queued, at vruntime 1000.
+        set.pop().unwrap();
+        set.advance_group_vruntime(1, 1000);
+
+        set.remove_group(1);
+        assert!(set.is_empty());
     }
 
     // remove_group: removes group, orphans future children, allows recreation
