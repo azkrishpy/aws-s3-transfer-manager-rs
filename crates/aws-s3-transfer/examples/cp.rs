@@ -122,6 +122,10 @@ pub struct Args {
     #[arg(long)]
     read_ahead_parts: Option<usize>,
 
+    /// Remove an existing destination file before downloading, instead of replacing it on success
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    replace_existing: bool,
+
     /// Enable tokio console (requires RUSTFLAGS="--cfg tokio_unstable")
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     tokio_console: bool,
@@ -319,6 +323,7 @@ async fn do_single_download(
     bucket: &str,
     key: &str,
     dest: &Path,
+    replace_existing: bool,
 ) -> Result<u64, BoxError> {
     let is_dev_null = dest == Path::new("/dev/null");
 
@@ -329,12 +334,12 @@ async fn do_single_download(
         handle.join().await?;
         Ok(obj_size_bytes)
     } else {
-        let handle = tm
-            .download()
-            .bucket(bucket)
-            .key(key)
-            .write_to_path(dest)
-            .await?;
+        let download = tm.download().bucket(bucket).key(key);
+        let handle = if replace_existing {
+            download.remove_and_write_to_path(dest).await?
+        } else {
+            download.write_to_path(dest).await?
+        };
         let obj_size_bytes = handle.object_meta().await?.total_object_size();
         handle.join().await?;
         Ok(obj_size_bytes)
@@ -427,6 +432,7 @@ async fn do_manifest_download(
     bucket: &str,
     entries: &[ManifestEntry],
     dest_dir: &Path,
+    replace_existing: bool,
 ) -> Result<u64, BoxError> {
     use tokio::task::JoinSet;
     let mut set = JoinSet::new();
@@ -443,7 +449,9 @@ async fn do_manifest_download(
             }
             p
         };
-        set.spawn(async move { do_single_download(&tm, &bucket, &key, &dest).await });
+        set.spawn(
+            async move { do_single_download(&tm, &bucket, &key, &dest, replace_existing).await },
+        );
     }
     let mut total = 0u64;
     while let Some(result) = set.join_next().await {
@@ -906,9 +914,14 @@ async fn transfer(
                 let (bucket, key) = args.source.expect_s3().parts();
                 let dest = args.dest.expect_local();
                 match (&manifest, args.recursive) {
-                    (Some(entries), _) => do_manifest_download(&tm, bucket, entries, dest).await?,
+                    (Some(entries), _) => {
+                        do_manifest_download(&tm, bucket, entries, dest, args.replace_existing)
+                            .await?
+                    }
                     (None, true) => do_recursive_download(&tm, bucket, key, dest).await?,
-                    (None, false) => do_single_download(&tm, bucket, key, dest).await?,
+                    (None, false) => {
+                        do_single_download(&tm, bucket, key, dest, args.replace_existing).await?
+                    }
                 }
             }
             Direction::Upload => {

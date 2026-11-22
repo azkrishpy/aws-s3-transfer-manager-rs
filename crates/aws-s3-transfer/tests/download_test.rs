@@ -1032,6 +1032,112 @@ async fn test_download_write_to_path_error_cleans_up() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+/// A download that fails after its first range keeps a file already at the
+/// destination, unless the caller asked to remove it first. Removal unlinks a
+/// symbolic link at the destination, never the file it points to.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_download_keeps_the_old_destination_unless_asked_to_remove_it() {
+    let data = rand_data(ByteSize::mib(20).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let failing_tm = || {
+        test_tm(
+            StaticReplayClient::new(vec![
+                head_event(data.len(), None),
+                ReplayEvent::new(
+                    dummy_expected_request(),
+                    http::Response::builder()
+                        .status(200)
+                        .header("Content-Length", format!("{}", part_size))
+                        .header(
+                            "Content-Range",
+                            format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                        )
+                        .header("ETag", "my-etag")
+                        .body(SdkBody::from(data.slice(0..part_size)))
+                        .unwrap(),
+                ),
+                ReplayEvent::new(
+                    dummy_expected_request(),
+                    http::Response::builder()
+                        .status(412)
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                ),
+            ]),
+            part_size,
+        )
+    };
+
+    for (remove, link) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("remove={remove} link={link}");
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest.dat");
+        let old = if link {
+            outside.path().join("old.dat")
+        } else {
+            dest.clone()
+        };
+        std::fs::write(&old, b"old").unwrap();
+        if link {
+            std::os::unix::fs::symlink(&old, &dest).unwrap();
+        }
+
+        let download = failing_tm()
+            .download()
+            .bucket("test-bucket")
+            .key("test-object");
+        let handle = if remove {
+            download.remove_and_write_to_path(&dest).await
+        } else {
+            download.write_to_path(&dest).await
+        }
+        .unwrap();
+        assert!(handle.join().await.is_err(), "{case}");
+
+        assert_eq!(dest.symlink_metadata().is_ok(), !remove, "{case}");
+        if !remove {
+            assert_eq!(std::fs::read(&dest).unwrap(), b"old", "{case}");
+        }
+        if link {
+            assert_eq!(std::fs::read(&old).unwrap(), b"old", "{case}: link target");
+        }
+    }
+}
+
+/// `remove_and_write_to_path` downloads to a path where no file exists, and
+/// refuses a directory before the download starts.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn remove_and_write_to_path_writes_a_new_destination() {
+    let data = rand_data(ByteSize::mib(10).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("output.dat");
+
+    tm.download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .remove_and_write_to_path(&dest)
+        .await
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&dest).unwrap(), data.as_ref());
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .remove_and_write_to_path(dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), &aws_s3_transfer::error::ErrorKind::IOError);
+}
+
 /// `write_to_file` rejects a destination opened in append mode before sending
 /// any request, and leaves the file's contents as they were.
 #[cfg(any(unix, windows))]
