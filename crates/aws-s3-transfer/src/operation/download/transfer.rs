@@ -4514,6 +4514,32 @@ mod tests {
         panic!("drive_to_completion exceeded {max_steps} steps without completing");
     }
 
+    /// A disk download drains each four filled parts as they arrive, leaving only
+    /// the tail of a five-part object to the terminal drain.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_download_drains_four_part_runs_before_completion() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+
+        let part_size = 8 * MB;
+        let object = object_bytes(5 * part_size as usize);
+        let config = crate::Config::builder()
+            .sdk_client(object_client(object))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build()
+            .expect("valid config");
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (transfer, _consumer, _dir) = disk_transfer(handle, &FileSinkFactory);
+
+        drive_to_completion(&[&transfer]).await;
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("diagnostics enabled");
+        assert_eq!(summary.destination_work.terminal_drain_parts, 1);
+    }
+
     /// REGRESSION (PR #154 review, landonxjames): the shared-admission deadlock for
     /// concurrent multi-part disk transfers below the drain batch must NOT wedge.
     ///
