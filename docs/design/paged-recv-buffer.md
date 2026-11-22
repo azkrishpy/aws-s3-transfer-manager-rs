@@ -254,8 +254,9 @@ A *drainable run* is the contiguous `FILLED` slice between `claim_cursor` and th
 A non-terminal claim takes it once it spans the drain batch, or once it reaches the end of a full
 segment (so a sub-batch tail residue still drains); a terminal claim takes whatever contiguous filled
 prefix exists. The drain batch is a minimum trigger coupled to the read-ahead window
-(`min(seg_size, window)`), so a window smaller than a segment drains in smaller runs instead of never
-sealing a segment. Completing a run frees its payloads and advances `drained_count`; dropping the
+(`min(4, window)` parts), so the file receives positioned writes while ranges are still arriving rather
+than in segment-sized bursts, and a narrow window drains in smaller runs instead of never sealing a
+segment. Completing a run frees its payloads and advances `drained_count`; dropping the
 token without completing runs the same drain, so an aborted consumer still frees its run and cannot
 stall reclaim.
 

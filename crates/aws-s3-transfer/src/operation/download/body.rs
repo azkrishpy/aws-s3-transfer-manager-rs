@@ -19,6 +19,10 @@ use super::ChunkMetadata;
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
 const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;
+
+/// Parts coalesced into one positioned write. Smaller runs keep the destination
+/// file busy while ranges are still arriving instead of writing in bursts.
+const DRAIN_BATCH: usize = 4;
 use super::transfer::DownloadTransfer;
 
 /// Wakeup signal wrapper. Under loom, tokio::sync::Notify is unavailable,
@@ -449,12 +453,12 @@ impl BodyWriter {
         self.drain(DrainMode::Eager)
     }
 
-    /// Couple the drain batch to the read-ahead window: a window narrower than a
-    /// segment drains in smaller runs so the block surface never waits for a run it
-    /// cannot accumulate. Capped at the segment size (the coalescing target). Called
-    /// at construction and whenever the window changes.
+    /// Couple the drain batch to the read-ahead window: a window narrower than the
+    /// batch drains in smaller runs so the block surface never waits for a run it
+    /// cannot accumulate. Capped at [`DRAIN_BATCH`]. Called at construction and
+    /// whenever the window changes.
     pub(crate) fn sync_drain_batch(&self, read_ahead: &super::read_ahead::ReadAhead) {
-        let batch = std::cmp::min(SEG_SIZE as u64, read_ahead.window().max(1)) as usize;
+        let batch = std::cmp::min(DRAIN_BATCH as u64, read_ahead.window().max(1)) as usize;
         self.buffer.set_drain_batch(batch);
     }
 
@@ -1407,6 +1411,31 @@ mod tests {
             "all {total} parts drained to disk, but the drains reported only \
              {freed_total} freed; issuance cannot reopen past the window"
         );
+    }
+
+    /// A disk body becomes drain-ready every four filled parts, or every window's
+    /// worth when the read-ahead window is narrower.
+    #[test]
+    fn disk_drain_batch_is_four_parts_or_the_window() {
+        use super::super::read_ahead::{window_parts_for, ReadAhead, WindowShare};
+        for (read_ahead_parts, batch) in [(1023, 4), (1, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = std::fs::File::create(dir.path().join("out")).unwrap();
+            let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+            let read_ahead = ReadAhead::new(
+                window_parts_for(&crate::config::ReadAhead::Parts(read_ahead_parts)),
+                Arc::new(WindowShare::new(0, 1)),
+            );
+            writer.sync_drain_batch(&read_ahead);
+            let first_ready = (0..8u64).position(|i| {
+                writer.claim().fill(chunk_at(i, i, &[i as u8])) == super::FillOutcome::DrainReady
+            });
+            assert_eq!(
+                first_ready,
+                Some(batch - 1),
+                "window of {read_ahead_parts} + 1 parts"
+            );
+        }
     }
 
     /// Concurrent, out-of-order fills across several segments must drain to the correct
