@@ -159,10 +159,10 @@ impl DownloadTransfer {
         // to a window in parts before `ctx` and `input` are moved into the struct.
         let window =
             super::read_ahead::resolve_window(input.read_ahead(), ctx.handle.config.read_ahead());
-        let read_ahead = ReadAhead::with_window(window);
+        let read_ahead = ReadAhead::new(window, ctx.handle.read_ahead_share.clone());
         // Couple the disk drain batch to the initial window, so a window below the
         // segment size drains in smaller runs from the first part.
-        writer.sync_drain_batch(window);
+        writer.sync_drain_batch(&read_ahead);
         let destination = if writer.has_sink() {
             DownloadDestination::File
         } else {
@@ -282,7 +282,7 @@ impl DownloadTransfer {
     pub(crate) fn set_read_ahead(&self, mode: &crate::config::ReadAhead) {
         let window = super::read_ahead::window_parts_for(mode);
         self.inner.read_ahead.set_window(window);
-        self.inner.writer.sync_drain_batch(window);
+        self.inner.writer.sync_drain_batch(&self.inner.read_ahead);
     }
 
     /// Release one part of read-ahead occupancy for a stream delivery, then wake the
@@ -3096,7 +3096,48 @@ mod tests {
         let (writer, consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        if capacity_bytes.is_some() {
+            // A lone download's `Auto` window equals the budget; open it so memory
+            // admission is the gate these tests reach.
+            transfer.inner.read_ahead.force_window(u64::MAX);
+        }
         (transfer, consumer)
+    }
+
+    /// Downloads of one client split its memory budget into `Auto` read-ahead windows.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn downloads_of_one_client_share_its_memory_budget() {
+        let part_size = 8 * MB;
+        let pool = crate::memory::BufferPool::builder()
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                4096 * part_size,
+            )))
+            .build()
+            .expect("test pool");
+        let get_obj = mock!(aws_sdk_s3::Client::get_object)
+            .then_output(|| GetObjectOutput::builder().build());
+        let config = crate::Config::builder()
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .memory(crate::config::MemoryConfig::Explicit(pool))
+            .build()
+            .expect("valid config");
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let download = || {
+            let input = DownloadInput::builder()
+                .bucket("test-bucket")
+                .key("test-key")
+                .build()
+                .unwrap();
+            let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+            let (ctx, _completion_rx) = TransferContext::new(handle.clone());
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        };
+        let first = download();
+        assert_eq!(first.inner.read_ahead.window(), 4096);
+        let _second = download();
+        assert_eq!(first.inner.read_ahead.window(), 2048);
     }
 
     /// The read-ahead gate bounds issuance at the current window: with a small window,
@@ -3472,6 +3513,8 @@ mod tests {
             .bucket("test-bucket")
             .key("test-key")
             .range(format!("bytes=0-{}", object_size - 1))
+            // Keep the drain batch above one part, so the tail waits for the terminal drain.
+            .read_ahead(crate::config::ReadAhead::Parts(15))
             .build()
             .unwrap();
 
@@ -3740,7 +3783,18 @@ mod tests {
             disk_test_handle(crc32_object_client(Arc::clone(&object), None), part_size),
             &FileSinkFactory,
         );
-        transfer.inner.writer.sync_drain_batch(1);
+        // Drain each part as it fills, so the first range reaches the file.
+        transfer.inner.read_ahead.force_window(1);
+        transfer
+            .inner
+            .writer
+            .sync_drain_batch(&transfer.inner.read_ahead);
+        transfer
+            .inner
+            .read_ahead
+            .set_window(super::super::read_ahead::window_parts_for(
+                &crate::config::ReadAhead::Auto,
+            ));
         assert_first_range_succeeds(&transfer).await;
         let mut integrity = {
             let mut state = transfer.inner.state.lock().unwrap();
@@ -4460,12 +4514,38 @@ mod tests {
         panic!("drive_to_completion exceeded {max_steps} steps without completing");
     }
 
+    /// A disk download drains each four filled parts as they arrive, leaving only
+    /// the tail of a five-part object to the terminal drain.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_download_drains_four_part_runs_before_completion() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+
+        let part_size = 8 * MB;
+        let object = object_bytes(5 * part_size as usize);
+        let config = crate::Config::builder()
+            .sdk_client(object_client(object))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build()
+            .expect("valid config");
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (transfer, _consumer, _dir) = disk_transfer(handle, &FileSinkFactory);
+
+        drive_to_completion(&[&transfer]).await;
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("diagnostics enabled");
+        assert_eq!(summary.destination_work.terminal_drain_parts, 1);
+    }
+
     /// REGRESSION (PR #154 review, landonxjames): the shared-admission deadlock for
     /// concurrent multi-part disk transfers below the drain batch must NOT wedge.
     ///
     /// Before the fix: a disk chunk's charge returned only on a drain (fires at the
-    /// batch `min(SEG_SIZE=16, window)` or a full segment) or the terminal finalize. A
-    /// multi-part object below a segment (2..15 parts) held ALL parts resident until
+    /// batch `min(4, window)` or a full segment) or the terminal finalize. A
+    /// multi-part object below the batch held ALL parts resident until
     /// terminal, which needs every part issued and therefore memory admission. Spread across
     /// concurrent transfers under tight shared admission, none could reach its part
     /// count, so none finalized, drained, or returned its carrier.
@@ -4478,7 +4558,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_multipart_disk_below_drain_batch_completes() {
         let part_size = 8 * MB;
-        let object_size = 2 * part_size; // 2 parts, below the 16-part drain batch
+        let object_size = 2 * part_size; // 2 parts, below the 4-part drain batch
 
         // Range-echoing mock: the content-range must match the requested range or
         // execute_get_range fails validation. (Fixed body works only for single-chunk.)
@@ -4523,6 +4603,11 @@ mod tests {
 
         let (a, _ca, _da) = disk_transfer(handle.clone(), &FileSinkFactory);
         let (b, _cb, _db) = disk_transfer(handle.clone(), &FileSinkFactory);
+        // Each budget share is 2 parts, which would make the batch the whole object.
+        // A wider window keeps the batch above the part count.
+        for t in [&a, &b] {
+            t.set_read_ahead(&crate::config::ReadAhead::Parts(15));
+        }
 
         // Pre-fix this wedges: both retain an undrainable resident seq-0 while
         // queued for part 1. Post-fix each flushes its resident run before waiting,
@@ -4548,9 +4633,9 @@ mod tests {
     /// "wait while holding undrained resident parts" wedge, reachable with LARGE multipart
     /// objects that are nowhere near terminal.
     ///
-    /// Two transfers, each a 20-part object (far above the 16-part drain batch, so the
+    /// Two transfers, each a 20-part object (far above the 4-part drain batch, so the
     /// small-object predicate `total_parts < batch` does NOT apply). Drive each to hold
-    /// 3 filled-undrained resident parts (3 < 16, so no non-terminal drain), then let a
+    /// 3 filled-undrained resident parts (3 < 4, so no non-terminal drain), then let a
     /// tight shared memory budget cap them mid-stream with 17 parts still remaining. Neither
     /// can issue (budget full), drain (below batch), or reach terminal (`remaining` far
     /// from done). Each is waiting on the other to release, and neither can — the exact
@@ -4563,9 +4648,9 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_large_multipart_partial_fills_complete() {
         let part_size = 8 * MB;
-        let parts_per_object = 20u64; // WELL above the 16-part drain batch
+        let parts_per_object = 20u64; // WELL above the 4-part drain batch
         let object_size = parts_per_object * part_size;
-        let resident_per_transfer = 3u64; // 3 < 16: never drains non-terminally
+        let resident_per_transfer = 3u64; // 3 < 4: never drains non-terminally
 
         // Range-echoing mock: each GET's content-range must match the requested range,
         // or execute_get_range's validate_content_range fails the transfer. (A fixed
@@ -4698,12 +4783,10 @@ mod tests {
         let t = build(ReadAhead::Parts(9), Some(ReadAhead::Parts(3)));
         assert_eq!(t.read_ahead().window(), 4, "request override wins");
 
-        // Client Auto resolves to the fixed default when not overridden.
+        // Client Auto resolves to the budget share: all of it for a lone download.
         let t = build(ReadAhead::Auto, None);
-        assert_eq!(
-            t.read_ahead().window(),
-            super::super::read_ahead::DEFAULT_WINDOW_PARTS
-        );
+        let budget_parts = t.ctx().handle.plan.ceiling_bytes as u64 / (8 * MB);
+        assert_eq!(t.read_ahead().window(), budget_parts);
     }
 
     /// `io_ctl().set_read_ahead` resolves the public knob to a window and applies it
@@ -4726,14 +4809,12 @@ mod tests {
             .set_read_ahead(crate::config::ReadAhead::Parts(0));
         assert_eq!(transfer.read_ahead().window(), 1);
 
-        // Auto returns to the default fixed window.
+        // Auto returns to the budget share: all of it for a lone download.
         transfer
             .io_ctl()
             .set_read_ahead(crate::config::ReadAhead::Auto);
-        assert_eq!(
-            transfer.read_ahead().window(),
-            super::super::read_ahead::DEFAULT_WINDOW_PARTS
-        );
+        let budget_parts = transfer.ctx().handle.plan.ceiling_bytes as u64 / (8 * MB);
+        assert_eq!(transfer.read_ahead().window(), budget_parts);
     }
 
     use crate::http::header::Range;

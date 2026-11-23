@@ -44,7 +44,10 @@ impl DownloadFluentBuilder {
     ///
     /// A file already at `path` is replaced when the download succeeds. It is
     /// unchanged until then, and left unchanged when the download fails or is
-    /// cancelled.
+    /// cancelled. Keeping it costs throughput when a large file is overwritten
+    /// repeatedly: its unwritten data stays in the page cache while the new file
+    /// is written. [`remove_and_write_to_path`](Self::remove_and_write_to_path)
+    /// removes it first instead.
     ///
     /// Successful completion means every byte was accepted by the operating
     /// system and the temporary file was renamed. It does not call `sync_data`,
@@ -60,6 +63,38 @@ impl DownloadFluentBuilder {
             self.handle,
             input,
             path.into(),
+            None,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
+        .await
+    }
+
+    /// Remove the file at `path`, if any, then download the object and write it
+    /// to `path` as [`write_to_path`](Self::write_to_path) does.
+    ///
+    /// The existing file is removed before any request is sent, so a failed or
+    /// cancelled download leaves no file at `path`. Use this when the previous
+    /// contents need not survive a failure. Removal unlinks the directory entry
+    /// at `path`, as the final rename replaces it: a symbolic link is removed,
+    /// not the file it points to. A directory at `path` is not removed, and
+    /// fails with [`ErrorKind::IOError`](crate::error::ErrorKind::IOError).
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    pub async fn remove_and_write_to_path(
+        self,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        let path = path.into();
+        match crate::io::fs::remove_file_async(&path).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(crate::error::io_at("removing", &path, e));
+            }
+            _ => {}
+        }
+        crate::operation::download::Download::orchestrate_to_path(
+            self.handle,
+            input,
+            path,
             None,
             &crate::operation::download::sink::FileSinkFactory,
         )

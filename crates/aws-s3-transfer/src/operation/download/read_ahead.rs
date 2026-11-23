@@ -22,38 +22,39 @@
 //!
 //! # Pacing
 //!
-//! The window is a fixed per-transfer cap
-//! ([`DEFAULT_WINDOW_PARTS`](crate::operation::download::read_ahead::DEFAULT_WINDOW_PARTS)).
-//! The pacing behaviors follow from the occupancy gate directly:
+//! In `Auto` mode the window is the transfer's share of the client's memory
+//! budget, in parts: the budget divided by the number of live downloads, never
+//! below [`DEFAULT_WINDOW_PARTS`](crate::operation::download::read_ahead::DEFAULT_WINDOW_PARTS)
+//! (or the whole budget, if smaller). A download running alone may fill the
+//! budget; concurrent downloads split it, and each share is recomputed on every
+//! gate read as downloads start and finish. The pacing behaviors follow from the
+//! occupancy gate directly:
 //!
 //! - Fast consumer: `released` keeps pace, `issued - released` stays small, the
 //!   gate does not bind, and the transfer runs at the concurrency limit.
 //! - Slow consumer: `released` lags, `issued - released` fills to the window, the
 //!   gate closes, and issuance pauses until the consumer drains. This transfer's
-//!   resident occupancy is then bounded at `window` parts. The client's shared
-//!   memory budget bounds aggregate demand across transfers and typically binds
-//!   a transfer before its read-ahead window fills.
+//!   resident occupancy is then bounded at `window` parts, its share of the budget.
 //! - Blocked consumer (a stalled or missing part): `released` cannot advance past
 //!   the hole, occupancy pins at the window, and issuance stops at `window`, leaving
 //!   a full window of slack to make progress around the hole rather than collapsing
 //!   to one part.
 //!
-//! The window is stored in an [`std::sync::atomic::AtomicU64`] so it can be lowered
+//! The window is stored in an [`std::sync::atomic::AtomicU64`] so it can be changed
 //! with a lock-free store while a transfer runs (see
 //! [`ReadAhead::set_window`](crate::operation::download::read_ahead::ReadAhead::set_window)).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// Fixed read-ahead window, in parts. A per-transfer cap on how far speculative
-/// issuance runs ahead of consumption, set well above the bandwidth-delay product of
-/// a 100 Gbps link so the gate does not bind a consumer that keeps pace. It is a
-/// per-transfer prefetch-depth ceiling, not the memory bound. The client's
-/// memory budget applies across transfers and usually binds concurrent work
-/// before one transfer reaches this window.
-///
-/// The default for the public [`ReadAhead::Auto`](crate::config::ReadAhead) mode;
-/// [`window_parts_for`] resolves the knob to a window in parts.
+/// Minimum `Auto` window, in parts: set well above the bandwidth-delay product of
+/// a 100 Gbps link so the gate does not bind a consumer that keeps pace, however
+/// many downloads share the budget. The memory budget still bounds the sum.
 pub(crate) const DEFAULT_WINDOW_PARTS: u64 = 1024;
+
+/// Stored window value meaning "use the `Auto` budget share". `Parts(n)` resolves
+/// to `n + 1`, so it never collides.
+const AUTO: u64 = 0;
 
 /// Resolve the effective read-ahead window in parts for a download, in precedence
 /// order: the per-request [`ReadAhead`](crate::config::ReadAhead) override if set,
@@ -65,51 +66,78 @@ pub(crate) fn resolve_window(
     window_parts_for(request.unwrap_or(client_default))
 }
 
-/// Map the public [`ReadAhead`](crate::config::ReadAhead) knob to a window in parts.
-/// `Auto` is the fixed per-transfer cap; `Parts(n)` is `n + 1` — `n` parts of
-/// speculation beyond the part the consumer is waiting on, which is always admitted,
-/// so `Parts(0)` is demand paging. The single definition of the knob's meaning, used
-/// at transfer construction and by the dynamic control surface.
+/// Map the public [`ReadAhead`](crate::config::ReadAhead) knob to a stored window.
+/// `Auto` is the budget share, resolved on each read; `Parts(n)` is `n + 1` — `n`
+/// parts of speculation beyond the part the consumer is waiting on, which is always
+/// admitted, so `Parts(0)` is demand paging. The single definition of the knob's
+/// meaning, used at transfer construction and by the dynamic control surface.
 pub(crate) fn window_parts_for(mode: &crate::config::ReadAhead) -> u64 {
     match mode {
-        crate::config::ReadAhead::Auto => DEFAULT_WINDOW_PARTS,
+        crate::config::ReadAhead::Auto => AUTO,
         crate::config::ReadAhead::Parts(n) => (*n as u64).saturating_add(1),
+    }
+}
+
+/// Client-wide `Auto` window: the memory budget in parts, divided among live downloads.
+#[derive(Debug)]
+pub(crate) struct WindowShare {
+    /// Memory budget in parts of the client's part size.
+    budget_parts: u64,
+    /// Live downloads, counted from construction until drop of their [`ReadAhead`].
+    // ceiling: a finished download counts until its handle drops; shares only fall to
+    // the floor. Decrement at the terminal transition if held handles matter.
+    active: AtomicU64,
+}
+
+impl WindowShare {
+    /// Share `budget_bytes` in parts of `part_size` bytes.
+    pub(crate) fn new(budget_bytes: u64, part_size: u64) -> Self {
+        Self {
+            budget_parts: budget_bytes / part_size.max(1),
+            active: AtomicU64::new(0),
+        }
+    }
+
+    /// Budget divided by live downloads, at least the floor, and at least one part.
+    fn window(&self) -> u64 {
+        let floor = DEFAULT_WINDOW_PARTS.min(self.budget_parts);
+        let share = self.budget_parts / self.active.load(Ordering::Relaxed).max(1);
+        share.max(floor).max(1)
     }
 }
 
 /// Per-transfer read-ahead window: the occupancy bound on speculative issuance.
 ///
-/// `window()` is the hot read (the issuance gate, per claim) and is lock-free. The
-/// value is fixed at construction; the [`AtomicU64`] allows it to be lowered with a
-/// lock-free store while the transfer runs. Shared `&self` across the issuer and
-/// consumer tasks.
+/// `window()` is the hot read (the issuance gate, per claim) and is lock-free.
+/// Shared `&self` across the issuer and consumer tasks. Counts as a live download
+/// in its [`WindowShare`] until dropped.
 pub(crate) struct ReadAhead {
-    /// Current window in parts. Read by the gate on every claim.
+    /// Stored window in parts, or [`AUTO`]. Read by the gate on every claim.
     window: AtomicU64,
+    share: Arc<WindowShare>,
 }
 
 impl ReadAhead {
-    /// Create a controller with the default fixed window ([`DEFAULT_WINDOW_PARTS`]).
-    pub(crate) fn new() -> Self {
-        Self::with_window(DEFAULT_WINDOW_PARTS)
-    }
-
-    /// Create a controller with an explicit window, in parts. The resolved value of
-    /// the public [`ReadAhead`](crate::config::ReadAhead) knob enters here.
-    pub(crate) fn with_window(parts: u64) -> Self {
+    /// Create a controller with a stored window from [`window_parts_for`].
+    pub(crate) fn new(window: u64, share: Arc<WindowShare>) -> Self {
+        share.active.fetch_add(1, Ordering::Relaxed);
         Self {
-            window: AtomicU64::new(parts),
+            window: AtomicU64::new(window),
+            share,
         }
     }
 
     /// The current read-ahead window, in parts. Lock-free; the issuance gate reads
     /// this per claim (`issued - released < window()`).
     pub(crate) fn window(&self) -> u64 {
-        self.window.load(Ordering::Relaxed)
+        match self.window.load(Ordering::Relaxed) {
+            AUTO => self.share.window(),
+            parts => parts,
+        }
     }
 
-    /// Set the window, in parts. Lock-free. Used to apply a dynamic read-ahead
-    /// change to a running transfer; the next gate read observes the new value.
+    /// Set the stored window from [`window_parts_for`]. Lock-free. Used to apply a
+    /// dynamic read-ahead change to a running transfer; the next gate read observes it.
     pub(crate) fn set_window(&self, parts: u64) {
         self.window.store(parts, Ordering::Relaxed);
     }
@@ -123,16 +151,16 @@ impl ReadAhead {
     }
 }
 
-impl Default for ReadAhead {
-    fn default() -> Self {
-        Self::new()
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        self.share.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl std::fmt::Debug for ReadAhead {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadAhead")
-            .field("window", &self.window.load(Ordering::Relaxed))
+            .field("window", &self.window())
             .finish()
     }
 }
@@ -142,46 +170,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_opens_at_the_fixed_default() {
-        // rwnd: the window is the fixed per-transfer ceiling from construction. No
-        // warm-up, no slow-start, no estimate to wait on.
-        let ra = ReadAhead::new();
-        assert_eq!(ra.window(), DEFAULT_WINDOW_PARTS);
-    }
+    fn auto_window_is_the_budget_share_of_live_downloads() {
+        let share = Arc::new(WindowShare::new(4096 * 8, 8));
+        let first = ReadAhead::new(AUTO, share.clone());
+        assert_eq!(first.window(), 4096, "a lone download may fill the budget");
+        let second = ReadAhead::new(AUTO, share.clone());
+        assert_eq!((first.window(), second.window()), (2048, 2048));
+        let more: Vec<_> = (0..6)
+            .map(|_| ReadAhead::new(AUTO, share.clone()))
+            .collect();
+        assert_eq!(
+            first.window(),
+            DEFAULT_WINDOW_PARTS,
+            "eight shares stop at the floor"
+        );
+        drop(more);
+        drop(second);
+        assert_eq!(
+            first.window(),
+            4096,
+            "finished downloads return their share"
+        );
 
-    #[test]
-    fn window_does_not_drift_on_its_own() {
-        // The controller never changes the window itself; only an explicit
-        // set_window (the dynamic read-ahead knob) moves it. Repeated reads with no
-        // writer are stable.
-        let ra = ReadAhead::new();
-        let w = ra.window();
-        for _ in 0..1000 {
-            assert_eq!(ra.window(), w, "window must not drift");
+        first.set_window(window_parts_for(&crate::config::ReadAhead::Parts(6)));
+        assert_eq!(first.window(), 7, "an explicit window ignores the share");
+        first.set_window(window_parts_for(&crate::config::ReadAhead::Auto));
+        assert_eq!(first.window(), 4096);
+
+        for (budget_parts, expected) in [(100, 100), (0, 1)] {
+            let small = ReadAhead::new(AUTO, Arc::new(WindowShare::new(budget_parts, 1)));
+            assert_eq!(small.window(), expected, "budget of {budget_parts} parts");
         }
-    }
-
-    #[test]
-    fn set_window_updates_the_value() {
-        let ra = ReadAhead::new();
-        ra.set_window(7);
-        assert_eq!(ra.window(), 7);
-        ra.set_window(1);
-        assert_eq!(ra.window(), 1);
-    }
-
-    #[test]
-    fn force_window_overrides_for_gate_tests() {
-        let ra = ReadAhead::new();
-        ra.force_window(3);
-        assert_eq!(ra.window(), 3);
     }
 
     #[test]
     fn window_parts_for_maps_the_knob() {
         use crate::config::ReadAhead as Knob;
-        // Auto -> the fixed default.
-        assert_eq!(window_parts_for(&Knob::Auto), DEFAULT_WINDOW_PARTS);
+        assert_eq!(window_parts_for(&Knob::Auto), AUTO);
         // Parts(n) -> n + 1: n speculative parts plus the always-admitted demand part.
         assert_eq!(
             window_parts_for(&Knob::Parts(0)),
